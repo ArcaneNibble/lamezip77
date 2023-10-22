@@ -151,39 +151,44 @@ impl<
         let tot_ahead_sz = self.tot_ahead_sz();
         assert!(bytes <= tot_ahead_sz);
 
-        if bytes <= lookahead_sz {
-            // consume bytes from internal buffer
-            self.buf.rpos += bytes;
-            if self.buf.rpos >= TOT_BUF_SZ {
-                self.buf.rpos -= TOT_BUF_SZ;
-            }
-            // refill internal buffer
-            let target_refill_sz = LOOKAHEAD_SZ - (lookahead_sz - bytes);
-            if let Some(inp) = self.inp.as_mut() {
-                let actual_refill_sz = core::cmp::min(inp.len(), target_refill_sz);
-                let refill_span = &inp[..actual_refill_sz];
+        // no matter how much we're trying to roll the window,
+        // the read pointer "just" advances (and wraps around)
+        // complexity doesn't arise until we need to
+        // potentially backfill the sliding window
+        self.buf.rpos = (self.buf.rpos + bytes) % TOT_BUF_SZ;
 
-                if self.buf.wpos + actual_refill_sz <= TOT_BUF_SZ {
+        // it's okay if this is None -- the assert for tot_ahead_sz
+        // makes sure that we haven't exceeded available data
+        if let Some(inp) = self.inp.as_mut() {
+            let cur_wpos = self.buf.wpos;
+            let target_wsz = core::cmp::min(bytes + (LOOKAHEAD_SZ - lookahead_sz), inp.len());
+            let target_wpos = (cur_wpos + target_wsz) % TOT_BUF_SZ;
+            self.buf.wpos = target_wpos;
+
+            // in the simple case, all we need to do is fill from
+            // cur_wpos to target_wpos with inp
+            // however, complexity arises if we manage to roll over
+            // more than the entirety of the buffer (including lookback)
+            if target_wsz < TOT_BUF_SZ {
+                if target_wpos >= cur_wpos {
                     // no wraparound
-                    self.buf.buf[self.buf.wpos..self.buf.wpos + actual_refill_sz]
-                        .copy_from_slice(refill_span);
-
-                    self.buf.wpos += actual_refill_sz;
+                    self.buf.buf[cur_wpos..target_wpos].copy_from_slice(&inp[..target_wsz]);
                 } else {
                     // wraparound
-                    let tail_len = TOT_BUF_SZ - self.buf.wpos;
-                    self.buf.buf[self.buf.wpos..TOT_BUF_SZ]
-                        .copy_from_slice(&refill_span[..tail_len]);
-                    self.buf.buf[..actual_refill_sz - tail_len]
-                        .copy_from_slice(&refill_span[tail_len..]);
-
-                    self.buf.wpos = actual_refill_sz - tail_len;
+                    self.buf.buf[cur_wpos..].copy_from_slice(&inp[..TOT_BUF_SZ - cur_wpos]);
+                    self.buf.buf[..target_wpos]
+                        .copy_from_slice(&inp[TOT_BUF_SZ - cur_wpos..target_wsz]);
                 }
-
-                *inp = &inp[actual_refill_sz..];
+            } else {
+                // we've rolled over more than a full buffer
+                // can reset everything so that it starts at the beginning
+                self.buf
+                    .buf
+                    .copy_from_slice(&inp[target_wsz - TOT_BUF_SZ..target_wsz]);
+                self.buf.rpos = LOOKBACK_SZ;
+                self.buf.wpos = 0;
             }
-        } else {
-            todo!()
+            *inp = &inp[target_wsz..];
         }
     }
 }
@@ -427,11 +432,11 @@ mod tests {
     }
 
     #[test]
-    fn roll_internal_buffer_only() {
+    fn roll_window_no_refill() {
+        // not passing in any input, so no refill possible
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
                 SlidingWindowBuf::new();
-            buf.buf[0..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
             buf.wpos = 8;
             let mut win = buf.flush();
             win.roll_window(5);
@@ -441,7 +446,6 @@ mod tests {
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
                 SlidingWindowBuf::new();
-            buf.buf[123..123 + 8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
             buf.rpos = 123;
             buf.wpos = 123 + 8;
             let mut win = buf.flush();
@@ -452,8 +456,6 @@ mod tests {
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
                 SlidingWindowBuf::new();
-            buf.buf[1024 + 256 - 4..].copy_from_slice(&[1, 2, 3, 4]);
-            buf.buf[..4].copy_from_slice(&[5, 6, 7, 8]);
             buf.rpos = 1024 + 256 - 4;
             buf.wpos = 4;
             let mut win = buf.flush();
@@ -464,8 +466,6 @@ mod tests {
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
                 SlidingWindowBuf::new();
-            buf.buf[1024 + 256 - 4..].copy_from_slice(&[1, 2, 3, 4]);
-            buf.buf[..4].copy_from_slice(&[5, 6, 7, 8]);
             buf.rpos = 1024 + 256 - 4;
             buf.wpos = 4;
             let mut win = buf.flush();
@@ -476,8 +476,6 @@ mod tests {
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
                 SlidingWindowBuf::new();
-            buf.buf[1024 + 256 - 4..].copy_from_slice(&[1, 2, 3, 4]);
-            buf.buf[..4].copy_from_slice(&[5, 6, 7, 8]);
             buf.rpos = 1024 + 256 - 4;
             buf.wpos = 4;
             let mut win = buf.flush();
@@ -485,11 +483,6 @@ mod tests {
             assert_eq!(buf.rpos, 1);
             assert_eq!(buf.wpos, 4);
         }
-    }
-
-    #[test]
-    fn roll_internal_no_refill() {
-        // not passing in any input, so no refill possible
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
                 SlidingWindowBuf::new();
@@ -513,8 +506,9 @@ mod tests {
     }
 
     #[test]
-    fn roll_internal_refill_exact() {
+    fn roll_window_refill_exact() {
         // refill with exactly as many bytes as consumed
+        // (i.e. lookahead starts full)
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
                 SlidingWindowBuf::new();
@@ -543,7 +537,9 @@ mod tests {
     }
 
     #[test]
-    fn roll_internal_fill_up() {
+    fn roll_window_fill_up() {
+        // refill with more bytes than consumed
+        // (i.e. lookahead starts insufficiently full)
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
                 SlidingWindowBuf::new();
@@ -560,6 +556,19 @@ mod tests {
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
                 SlidingWindowBuf::new();
+            buf.rpos = 123;
+            buf.wpos = 123;
+            let mut win = buf.add_inp(&[1, 2, 3, 4, 5]);
+            win.roll_window(1);
+            assert_eq!(win.inp, Some(&[][..]));
+            assert_eq!(buf.rpos, 124);
+            assert_eq!(buf.wpos, 123 + 5);
+            assert_eq!(buf.buf[123..123 + 5], [1, 2, 3, 4, 5]);
+            assert_eq!(buf.buf[123 + 5], 0);
+        }
+        {
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
+                SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[123; 500]);
             win.roll_window(0);
             assert_eq!(win.inp, Some(&[123; 500 - 256][..]));
@@ -567,6 +576,78 @@ mod tests {
             assert_eq!(buf.wpos, 256);
             assert_eq!(buf.buf[..256], [123; 256]);
             assert_eq!(buf.buf[256], 0);
+        }
+        {
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
+                SlidingWindowBuf::new();
+            let mut win = buf.add_inp(&[123; 500]);
+            win.roll_window(111);
+            assert_eq!(win.inp, Some(&[123; 500 - 256 - 111][..]));
+            assert_eq!(buf.rpos, 111);
+            assert_eq!(buf.wpos, 111 + 256);
+            assert_eq!(buf.buf[..111 + 256], [123; 111 + 256]);
+            assert_eq!(buf.buf[111 + 256..], [0; 1024 + 256 - (111 + 256)]);
+        }
+        // small, very exhaustive tests
+        {
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+            win.roll_window(0);
+            assert_eq!(win.inp, Some(&[5, 6, 7, 8, 9, 10, 11, 12][..]));
+            assert_eq!(buf.rpos, 0);
+            assert_eq!(buf.wpos, 4);
+            assert_eq!(buf.buf[..4], [1, 2, 3, 4]);
+            assert_eq!(buf.buf[4..], [0; 8]);
+        }
+        {
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+            win.roll_window(7);
+            assert_eq!(win.inp, Some(&[12][..]));
+            assert_eq!(buf.rpos, 7);
+            assert_eq!(buf.wpos, 11);
+            assert_eq!(buf.buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]);
+        }
+        {
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            buf.wpos = 2;
+            let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+            win.roll_window(9);
+            assert_eq!(win.inp, Some(&[12][..]));
+            assert_eq!(buf.rpos, 9);
+            assert_eq!(buf.wpos, 1);
+            assert_eq!(buf.buf, [11, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        }
+    }
+
+    #[test]
+    fn roll_window_loop_around() {
+        {
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+            win.roll_window(8);
+            assert_eq!(win.inp, Some(&[][..]));
+            assert_eq!(buf.rpos, 8);
+            assert_eq!(buf.wpos, 0);
+            assert_eq!(buf.buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        }
+        {
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+            win.roll_window(9);
+            assert_eq!(win.inp, Some(&[14, 15, 16][..]));
+            assert_eq!(buf.rpos, 8);
+            assert_eq!(buf.wpos, 0);
+            assert_eq!(buf.buf, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        }
+        {
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+            win.roll_window(9);
+            assert_eq!(win.inp, Some(&[][..]));
+            assert_eq!(buf.rpos, 9);
+            assert_eq!(buf.wpos, 0);
+            assert_eq!(buf.buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         }
     }
 }
