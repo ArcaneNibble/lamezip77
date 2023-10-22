@@ -381,9 +381,8 @@ mod tests {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
                 SlidingWindowBuf::new();
             buf.buf[1024 + 256 - 1] = 1;
-            buf.buf[..4].copy_from_slice(&[2, 3, 4, 5]);
             buf.rpos = 1024 + 256 - 1;
-            buf.wpos = 4;
+            buf.wpos = 0;
             let win = buf.flush();
             assert_eq!(win.peek_byte(), 1);
             let win = buf.add_inp(&[9, 10, 11]);
