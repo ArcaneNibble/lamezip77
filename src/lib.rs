@@ -133,6 +133,15 @@ impl<
         }
     }
 
+    fn peek_byte(&self) -> u8 {
+        let lookahead_valid_sz = self.buf.lookahead_valid_sz();
+        if lookahead_valid_sz == 0 {
+            self.inp.unwrap()[0]
+        } else {
+            self.buf.buf[self.buf.rpos]
+        }
+    }
+
     fn tot_ahead(&self) -> usize {
         self.buf.lookahead_valid_sz() + self.inp.map_or(0, |x| x.len())
     }
@@ -305,5 +314,68 @@ mod tests {
         assert_eq!(spans.0, [1, 2, 3]);
         assert_eq!(spans.1, Some(&[4, 5][..]));
         assert_eq!(spans.2, Some(&[6, 7, 8][..]));
+    }
+
+    #[test]
+    fn peek_from_inp() {
+        {
+            let buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
+                SlidingWindowBuf::new();
+            let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!(win.peek_byte(), 1);
+        }
+        {
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
+                SlidingWindowBuf::new();
+            buf.rpos = 123;
+            buf.wpos = 123;
+            let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!(win.peek_byte(), 1);
+        }
+        {
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
+                SlidingWindowBuf::new();
+            buf.rpos = 1024 + 256 - 1;
+            buf.wpos = 1024 + 256 - 1;
+            let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!(win.peek_byte(), 1);
+        }
+    }
+
+    #[test]
+    fn peek_from_buf() {
+        {
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
+                SlidingWindowBuf::new();
+            buf.buf[0..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            buf.wpos = 8;
+            let win = buf.flush();
+            assert_eq!(win.peek_byte(), 1);
+            let win = buf.add_inp(&[9, 10, 11]);
+            assert_eq!(win.peek_byte(), 1);
+        }
+        {
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
+                SlidingWindowBuf::new();
+            buf.buf[123..123 + 8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            buf.rpos = 123;
+            buf.wpos = 123 + 8;
+            let win = buf.flush();
+            assert_eq!(win.peek_byte(), 1);
+            let win = buf.add_inp(&[9, 10, 11]);
+            assert_eq!(win.peek_byte(), 1);
+        }
+        {
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
+                SlidingWindowBuf::new();
+            buf.buf[1024 + 256 - 4..].copy_from_slice(&[1, 2, 3, 4]);
+            buf.buf[..4].copy_from_slice(&[5, 6, 7, 8]);
+            buf.rpos = 1024 + 256 - 4;
+            buf.wpos = 4;
+            let win = buf.flush();
+            assert_eq!(win.peek_byte(), 1);
+            let win = buf.add_inp(&[9, 10, 11]);
+            assert_eq!(win.peek_byte(), 1);
+        }
     }
 }
