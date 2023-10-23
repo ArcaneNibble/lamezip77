@@ -106,7 +106,7 @@ impl<
     fn get_next_spans(&self, from_pos: u64, bytes: usize) -> SpanSet {
         assert!(from_pos <= self.buf.rpos_real_offs);
         // assert!(from_pos >= self.buf.rpos_real_offs - LOOKBACK_SZ);
-        assert!(from_pos + LOOKBACK_SZ as u64 >= self.buf.rpos_real_offs);
+        assert!(from_pos + LOOKBACK_SZ as u64 >= self.buf.rpos_real_offs); // won't overflow when subtracting
         let dist_to_look_back = (self.buf.rpos_real_offs - from_pos) as usize; // <= LOOKBACK_SZ, >= 0
         let dist_to_look_forward = if bytes > dist_to_look_back {
             let tot_ahead_sz = self.tot_ahead_sz();
@@ -127,13 +127,15 @@ impl<
             // all from input
             SpanSet(&self.inp.unwrap()[..dist_to_look_forward], None, None)
         } else {
-            let sz_from_internal_buf = if dist_to_look_forward <= lookahead_valid_sz {
-                dist_to_look_back + dist_to_look_forward
-            } else {
-                dist_to_look_back + lookahead_valid_sz
-            };
-            let sz_from_external_buf =
-                dist_to_look_back + dist_to_look_forward - sz_from_internal_buf;
+            let (sz_from_internal_buf, sz_from_external_buf) =
+                if dist_to_look_forward <= lookahead_valid_sz {
+                    (dist_to_look_back + dist_to_look_forward, 0)
+                } else {
+                    (
+                        dist_to_look_back + lookahead_valid_sz,
+                        dist_to_look_forward - lookahead_valid_sz,
+                    )
+                };
             let external_slice = if sz_from_external_buf != 0 {
                 Some(&self.inp.unwrap()[..sz_from_external_buf])
             } else {
