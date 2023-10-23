@@ -184,14 +184,18 @@ impl<
 
         // no matter how much we're trying to roll the window,
         // the read pointer "just" advances (and wraps around)
-        // complexity doesn't arise until we need to
-        // potentially backfill the sliding window
+        // (i.e. if rpos ends up conceptually "inside inp",
+        // this calculation still holds)
+        // the only time it doesn't is if we roll more than the whole buffer at once
+        // (where rpos will be completely rewritten)
         self.buf.rpos = (self.buf.rpos + bytes) % TOT_BUF_SZ;
 
         // it's okay if this is None -- the assert for tot_ahead_sz
         // makes sure that we haven't exceeded available data
         if let Some(inp) = self.inp.as_mut() {
             let cur_wpos = self.buf.wpos;
+            // the amount we're rolling the window,
+            // plus however much is needed to make the lookahead fill up
             let ideal_target_wsz = bytes + (LOOKAHEAD_SZ - lookahead_valid_sz);
             let target_wsz = core::cmp::min(ideal_target_wsz, inp.len());
             let target_wpos = (cur_wpos + target_wsz) % TOT_BUF_SZ;
