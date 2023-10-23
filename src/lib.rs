@@ -2,9 +2,6 @@ struct SlidingWindowBuf<
     const LOOKBACK_SZ: usize,
     const LOOKAHEAD_SZ: usize,
     const TOT_BUF_SZ: usize,
-    const MIN_MATCH: usize,
-    const MAX_MATCH: usize,
-    const HASH_BITS: u64,
 > {
     buf: [u8; TOT_BUF_SZ],
     rpos: usize,
@@ -16,14 +13,8 @@ struct SlidingWindowBuf<
     rpos_real_offs: u64,
 }
 
-impl<
-        const LOOKBACK_SZ: usize,
-        const LOOKAHEAD_SZ: usize,
-        const TOT_BUF_SZ: usize,
-        const MIN_MATCH: usize,
-        const MAX_MATCH: usize,
-        const HASH_BITS: u64,
-    > SlidingWindowBuf<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ, MIN_MATCH, MAX_MATCH, HASH_BITS>
+impl<const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: usize>
+    SlidingWindowBuf<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ>
 {
     fn new() -> Self {
         assert!(TOT_BUF_SZ == LOOKBACK_SZ + LOOKAHEAD_SZ);
@@ -39,17 +30,14 @@ impl<
     fn add_inp<'a>(
         &'a mut self,
         inp: &'a [u8],
-    ) -> SlidingWindow<'a, LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ, MIN_MATCH, MAX_MATCH, HASH_BITS>
-    {
+    ) -> SlidingWindow<'a, LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ> {
         SlidingWindow {
             buf: self,
             inp: Some(inp),
         }
     }
 
-    fn flush(
-        &mut self,
-    ) -> SlidingWindow<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ, MIN_MATCH, MAX_MATCH, HASH_BITS> {
+    fn flush(&mut self) -> SlidingWindow<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ> {
         SlidingWindow {
             buf: self,
             inp: None,
@@ -78,30 +66,13 @@ struct SlidingWindow<
     const LOOKBACK_SZ: usize,
     const LOOKAHEAD_SZ: usize,
     const TOT_BUF_SZ: usize,
-    const MIN_MATCH: usize,
-    const MAX_MATCH: usize,
-    const HASH_BITS: u64,
 > {
-    buf: &'a mut SlidingWindowBuf<
-        LOOKBACK_SZ,
-        LOOKAHEAD_SZ,
-        TOT_BUF_SZ,
-        MIN_MATCH,
-        MAX_MATCH,
-        HASH_BITS,
-    >,
+    buf: &'a mut SlidingWindowBuf<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ>,
     inp: Option<&'a [u8]>,
 }
 
-impl<
-        'a,
-        const LOOKBACK_SZ: usize,
-        const LOOKAHEAD_SZ: usize,
-        const TOT_BUF_SZ: usize,
-        const MIN_MATCH: usize,
-        const MAX_MATCH: usize,
-        const HASH_BITS: u64,
-    > SlidingWindow<'a, LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ, MIN_MATCH, MAX_MATCH, HASH_BITS>
+impl<'a, const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: usize>
+    SlidingWindow<'a, LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ>
 {
     fn get_next_spans(&self, from_pos: u64, bytes: usize) -> SpanSet {
         assert!(from_pos <= self.buf.rpos_real_offs);
@@ -231,6 +202,121 @@ impl<
     }
 }
 
+enum LZOutput {
+    Lit(u8),
+    Ref { disp: u64, len: u64 },
+}
+
+struct HashBits<
+    const MIN_MATCH: u64,
+    const HASH_BITS: usize,
+    const HASH_SZ: usize,
+    const DICT_BITS: usize,
+    const DICT_SZ: usize,
+> {
+    htab: [u64; HASH_SZ],
+    prev: [u64; DICT_SZ],
+    initial_lits_done: u64,
+    hash_of_head: u32,
+}
+
+impl<
+        const MIN_MATCH: u64,
+        const HASH_BITS: usize,
+        const HASH_SZ: usize,
+        const DICT_BITS: usize,
+        const DICT_SZ: usize,
+    > HashBits<MIN_MATCH, HASH_BITS, HASH_SZ, DICT_BITS, DICT_SZ>
+{
+    fn new() -> Self {
+        Self {
+            htab: [0; HASH_SZ],
+            prev: [0; DICT_SZ],
+            initial_lits_done: 0,
+            hash_of_head: 0,
+        }
+    }
+    fn calc_new_hash(&self, old_hash: u32, b: u8) -> u32 {
+        let hash_shift = ((HASH_BITS as u64) + MIN_MATCH - 1) / MIN_MATCH;
+        let hash = (old_hash << hash_shift) ^ (b as u32);
+        hash & ((1 << HASH_BITS) - 1)
+    }
+}
+
+struct LZEngine<
+    const LOOKBACK_SZ: usize,
+    const LOOKAHEAD_SZ: usize,
+    const TOT_BUF_SZ: usize,
+    const MIN_MATCH: u64,
+    const MAX_MATCH: u64,
+    const HASH_BITS: usize,
+    const HASH_SZ: usize,
+    const DICT_BITS: usize,
+    const DICT_SZ: usize,
+    const MIN_DISP: u64,
+> {
+    sbuf: SlidingWindowBuf<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ>,
+    h: HashBits<MIN_MATCH, HASH_BITS, HASH_SZ, DICT_BITS, DICT_SZ>,
+}
+
+impl<
+        const LOOKBACK_SZ: usize,
+        const LOOKAHEAD_SZ: usize,
+        const TOT_BUF_SZ: usize,
+        const MIN_MATCH: u64,
+        const MAX_MATCH: u64,
+        const HASH_BITS: usize,
+        const HASH_SZ: usize,
+        const DICT_BITS: usize,
+        const DICT_SZ: usize,
+        const MIN_DISP: u64,
+    >
+    LZEngine<
+        LOOKBACK_SZ,
+        LOOKAHEAD_SZ,
+        TOT_BUF_SZ,
+        MIN_MATCH,
+        MAX_MATCH,
+        HASH_BITS,
+        HASH_SZ,
+        DICT_BITS,
+        DICT_SZ,
+        MIN_DISP,
+    >
+{
+    fn new() -> Self {
+        assert_eq!(HASH_SZ, 1 << HASH_BITS);
+        assert_eq!(DICT_SZ, 1 << DICT_BITS);
+        assert!(MIN_DISP >= 1);
+        assert!(HASH_BITS <= 32);
+
+        Self {
+            sbuf: SlidingWindowBuf::new(),
+            h: HashBits::new(),
+        }
+    }
+
+    fn compres<O>(&mut self, inp: &[u8], mut outp: O)
+    where
+        O: FnMut(LZOutput),
+    {
+        let (mut sbuf, mut h) = (&mut self.sbuf, &mut self.h);
+        let mut win = sbuf.add_inp(inp);
+
+        while h.initial_lits_done < MIN_MATCH {
+            // the first MIN_MATCH bytes can never be compressed as a backreference,
+            // and we need to prime the hash table
+            if win.tot_ahead_sz() == 0 {
+                return;
+            }
+            let b = win.peek_byte();
+            outp(LZOutput::Lit(b));
+            h.hash_of_head = h.calc_new_hash(h.hash_of_head, b);
+            h.initial_lits_done += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,8 +324,7 @@ mod tests {
     #[test]
     fn span_all_from_inp() {
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
             let spans = win.get_next_spans(0, 4);
             assert_eq!(spans.0, [1, 2, 3, 4]);
@@ -247,8 +332,7 @@ mod tests {
             assert_eq!(spans.2, None)
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 123;
             buf.wpos = 123;
             let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
@@ -258,8 +342,7 @@ mod tests {
             assert_eq!(spans.2, None)
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 1024 + 256 - 1;
             buf.wpos = 1024 + 256 - 1;
             let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
@@ -273,8 +356,7 @@ mod tests {
     #[test]
     fn span_all_from_buf_no_wrap() {
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.buf[0..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
             buf.wpos = 8;
             let win = buf.flush();
@@ -284,8 +366,7 @@ mod tests {
             assert_eq!(spans.2, None)
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.buf[123..123 + 8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
             buf.rpos = 123;
             buf.wpos = 123 + 8;
@@ -296,8 +377,7 @@ mod tests {
             assert_eq!(spans.2, None)
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.buf[1024 + 256 - 4..].copy_from_slice(&[1, 2, 3, 4]);
             buf.buf[..4].copy_from_slice(&[5, 6, 7, 8]);
             buf.rpos = 1024 + 256 - 4;
@@ -313,8 +393,7 @@ mod tests {
     #[test]
     fn span_all_from_buf_yes_wrap() {
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.buf[1024 + 256 - 4..].copy_from_slice(&[1, 2, 3, 4]);
             buf.buf[..4].copy_from_slice(&[5, 6, 7, 8]);
             buf.rpos = 1024 + 256 - 4;
@@ -326,8 +405,7 @@ mod tests {
             assert_eq!(spans.2, None)
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.buf[1024 + 256 - 1] = 1;
             buf.buf[..7].copy_from_slice(&[2, 3, 4, 5, 6, 7, 8]);
             buf.rpos = 1024 + 256 - 1;
@@ -339,8 +417,7 @@ mod tests {
             assert_eq!(spans.2, None)
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.buf[1024 + 256 - 7..].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7]);
             buf.buf[0] = 8;
             buf.rpos = 1024 + 256 - 7;
@@ -356,8 +433,7 @@ mod tests {
     #[test]
     fn span_straddle_no_wrap() {
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.buf[0..3].copy_from_slice(&[1, 2, 3]);
             buf.wpos = 3;
             let win = buf.add_inp(&[4, 5, 6, 7, 8]);
@@ -367,8 +443,7 @@ mod tests {
             assert_eq!(spans.2, None)
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.buf[123..123 + 5].copy_from_slice(&[1, 2, 3, 4, 5]);
             buf.rpos = 123;
             buf.wpos = 123 + 5;
@@ -382,8 +457,7 @@ mod tests {
 
     #[test]
     fn span_straddle_yes_wrap() {
-        let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-            SlidingWindowBuf::new();
+        let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
         buf.buf[1024 + 256 - 3..].copy_from_slice(&[1, 2, 3]);
         buf.buf[..2].copy_from_slice(&[4, 5]);
         buf.rpos = 1024 + 256 - 3;
@@ -398,22 +472,19 @@ mod tests {
     #[test]
     fn peek_from_inp() {
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
             assert_eq!(win.peek_byte(), 1);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 123;
             buf.wpos = 123;
             let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
             assert_eq!(win.peek_byte(), 1);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 1024 + 256 - 1;
             buf.wpos = 1024 + 256 - 1;
             let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
@@ -424,8 +495,7 @@ mod tests {
     #[test]
     fn peek_from_buf() {
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.buf[0..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
             buf.wpos = 8;
             let win = buf.flush();
@@ -434,8 +504,7 @@ mod tests {
             assert_eq!(win.peek_byte(), 1);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.buf[123..123 + 8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
             buf.rpos = 123;
             buf.wpos = 123 + 8;
@@ -445,8 +514,7 @@ mod tests {
             assert_eq!(win.peek_byte(), 1);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.buf[1024 + 256 - 4..].copy_from_slice(&[1, 2, 3, 4]);
             buf.buf[..4].copy_from_slice(&[5, 6, 7, 8]);
             buf.rpos = 1024 + 256 - 4;
@@ -457,8 +525,7 @@ mod tests {
             assert_eq!(win.peek_byte(), 1);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.buf[1024 + 256 - 1] = 1;
             buf.rpos = 1024 + 256 - 1;
             buf.wpos = 0;
@@ -473,8 +540,7 @@ mod tests {
     fn roll_window_no_refill() {
         // not passing in any input, so no refill possible
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.wpos = 8;
             let mut win = buf.flush();
             win.roll_window(5);
@@ -482,8 +548,7 @@ mod tests {
             assert_eq!(buf.wpos, 8);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 123;
             buf.wpos = 123 + 8;
             let mut win = buf.flush();
@@ -492,8 +557,7 @@ mod tests {
             assert_eq!(buf.wpos, 123 + 8);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 1024 + 256 - 4;
             buf.wpos = 4;
             let mut win = buf.flush();
@@ -502,8 +566,7 @@ mod tests {
             assert_eq!(buf.wpos, 4);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 1024 + 256 - 4;
             buf.wpos = 4;
             let mut win = buf.flush();
@@ -512,8 +575,7 @@ mod tests {
             assert_eq!(buf.wpos, 4);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 1024 + 256 - 4;
             buf.wpos = 4;
             let mut win = buf.flush();
@@ -522,8 +584,7 @@ mod tests {
             assert_eq!(buf.wpos, 4);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 123;
             buf.wpos = 123 + 256;
             let mut win = buf.flush();
@@ -532,8 +593,7 @@ mod tests {
             assert_eq!(buf.wpos, 123 + 256);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 1024 + 256 - 123;
             buf.wpos = 256 - 123;
             let mut win = buf.flush();
@@ -548,8 +608,7 @@ mod tests {
         // refill with exactly as many bytes as consumed
         // (i.e. lookahead starts full)
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 123;
             buf.wpos = 123 + 256;
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5]);
@@ -560,8 +619,7 @@ mod tests {
             assert_eq!(buf.buf[123 + 256 + 5], 0);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 1024 - 2;
             buf.wpos = 1024 + 256 - 2;
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5]);
@@ -579,8 +637,7 @@ mod tests {
         // refill with more bytes than consumed
         // (i.e. lookahead starts insufficiently full)
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 123;
             buf.wpos = 123;
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5]);
@@ -592,8 +649,7 @@ mod tests {
             assert_eq!(buf.buf[123 + 5], 0);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 123;
             buf.wpos = 123;
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5]);
@@ -605,8 +661,7 @@ mod tests {
             assert_eq!(buf.buf[123 + 5], 0);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[123; 500]);
             win.roll_window(0);
             assert_eq!(win.inp, Some(&[123; 500 - 256][..]));
@@ -616,8 +671,7 @@ mod tests {
             assert_eq!(buf.buf[256], 0);
         }
         {
-            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }, 3, 512, 15> =
-                SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[123; 500]);
             win.roll_window(111);
             assert_eq!(win.inp, Some(&[123; 500 - 256 - 111][..]));
@@ -628,7 +682,7 @@ mod tests {
         }
         // small, very exhaustive tests
         {
-            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             win.roll_window(0);
             assert_eq!(win.inp, Some(&[5, 6, 7, 8, 9, 10, 11, 12][..]));
@@ -638,7 +692,7 @@ mod tests {
             assert_eq!(buf.buf[4..], [0; 8]);
         }
         {
-            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             win.roll_window(7);
             assert_eq!(win.inp, Some(&[12][..]));
@@ -647,7 +701,7 @@ mod tests {
             assert_eq!(buf.buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]);
         }
         {
-            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             buf.wpos = 2;
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             win.roll_window(9);
@@ -661,7 +715,7 @@ mod tests {
     #[test]
     fn roll_window_loop_around() {
         {
-            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             buf.rpos = 7;
             buf.wpos = 7;
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
@@ -672,7 +726,7 @@ mod tests {
             assert_eq!(buf.buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         }
         {
-            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
             win.roll_window(9);
             assert_eq!(win.inp, Some(&[14, 15, 16][..]));
@@ -681,7 +735,7 @@ mod tests {
             assert_eq!(buf.buf, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
         }
         {
-            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             win.roll_window(9);
             assert_eq!(win.inp, Some(&[][..]));
@@ -690,7 +744,7 @@ mod tests {
             assert_eq!(buf.buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         }
         {
-            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             win.roll_window(11);
             assert_eq!(win.inp, Some(&[][..]));
@@ -699,7 +753,7 @@ mod tests {
             assert_eq!(buf.buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         }
         {
-            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             win.roll_window(12);
             assert_eq!(win.inp, Some(&[][..]));
@@ -712,7 +766,7 @@ mod tests {
     #[test]
     fn lookback_span_simple() {
         {
-            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
             win.roll_window(4);
             // now we have 4 bytes in lookback, 4 bytes in lookahead, [8 9 10 11] not used yet
@@ -744,7 +798,7 @@ mod tests {
         }
         {
             // test having less than max lookbehind
-            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+            let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[0, 1, 2]);
             win.roll_window(3);
             let spans = win.get_next_spans(0, 1000);
@@ -768,7 +822,7 @@ mod tests {
 
     #[test]
     fn lookback_span_multiple_adds() {
-        let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+        let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
         let mut win = buf.add_inp(&[0, 1, 2]);
         win.roll_window(3);
         let mut win = buf.add_inp(&[3, 4, 5, 6]);
@@ -801,7 +855,7 @@ mod tests {
 
     #[test]
     fn loopback_span_having_overwritten() {
-        let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }, 3, 512, 15> = SlidingWindowBuf::new();
+        let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
         let mut win = buf.add_inp(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
         win.roll_window(8);
         // 8 bytes in lookback, 4 in lookahead, 2 in inp
@@ -823,5 +877,33 @@ mod tests {
         assert_eq!(spans.0, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         assert_eq!(spans.1, Some(&[12, 13][..]));
         assert_eq!(spans.2, None);
+    }
+
+    #[test]
+    fn hash_3_15() {
+        let hb: HashBits<3, 15, { 1 << 15 }, 15, { 1 << 15 }> = HashBits::new();
+        let h = 0;
+        let h = hb.calc_new_hash(h, 0xF2);
+        assert_eq!(h, 0xF2);
+        let h = hb.calc_new_hash(h, 0x34);
+        assert_eq!(h, (0xF2 << 5) ^ 0x34);
+        // note: tests bit truncation
+        let h = hb.calc_new_hash(h, 0x56);
+        assert_eq!(h, (0x12 << 10) ^ (0x34 << 5) ^ 0x56);
+    }
+
+    #[test]
+    fn hash_4_15() {
+        let hb: HashBits<4, 15, { 1 << 15 }, 15, { 1 << 15 }> = HashBits::new();
+        let h = 0;
+        let h = hb.calc_new_hash(h, 0xF2);
+        assert_eq!(h, 0xF2);
+        let h = hb.calc_new_hash(h, 0x34);
+        assert_eq!(h, (0xF2 << 4) ^ 0x34);
+        // // note: tests bit truncation
+        let h = hb.calc_new_hash(h, 0x56);
+        assert_eq!(h, (0x72 << 8) ^ (0x34 << 4) ^ 0x56);
+        let h = hb.calc_new_hash(h, 0x78);
+        assert_eq!(h, (0x2 << 12) ^ (0x34 << 8) ^ (0x56 << 4) ^ 0x78);
     }
 }
