@@ -216,12 +216,17 @@ impl<'a, const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: 
         }
     }
 
-    fn peek_byte(&self) -> u8 {
-        let lookahead_valid_sz = self.buf.lookahead_valid_sz();
-        if lookahead_valid_sz == 0 {
-            self.inp[0]
+    fn peek_byte(&self, offs: usize) -> u8 {
+        if offs >= self.tot_ahead_sz() {
+            // return something invalid (used for calculating hash at the end of the stream)
+            0
         } else {
-            self.buf.buf[self.buf.rpos]
+            let lookahead_valid_sz = self.buf.lookahead_valid_sz();
+            if offs < lookahead_valid_sz {
+                self.buf.buf[(self.buf.rpos + offs) % TOT_BUF_SZ]
+            } else {
+                self.inp[offs - lookahead_valid_sz]
+            }
         }
     }
 
@@ -346,12 +351,13 @@ impl<
         &mut self,
         win: &SlidingWindow<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ>,
     ) -> u64 {
-        let b = win.peek_byte();
-        self.hash_of_head = self.calc_new_hash(self.hash_of_head, b);
         let old_hpos = self.htab[self.hash_of_head as usize];
         self.htab[self.hash_of_head as usize] = win.buf.rpos_real_offs;
         let prev_idx = win.buf.rpos_real_offs & ((1 << DICT_BITS) - 1);
         self.prev[prev_idx as usize] = old_hpos;
+
+        let b = win.peek_byte(MIN_MATCH as usize);
+        self.hash_of_head = self.calc_new_hash(self.hash_of_head, b);
 
         old_hpos
     }
@@ -445,7 +451,7 @@ impl<
             if win.tot_ahead_sz() == 0 {
                 return;
             }
-            let b = win.peek_byte();
+            let b = win.peek_byte(0);
             outp(LZOutput::Lit(b));
             self.h.initial_lits_done += 1;
             win.roll_window(1);
@@ -463,7 +469,7 @@ impl<
 
         // XXX is this the right condition?
         while win.tot_ahead_sz() >= if end_of_stream { 1 } else { LOOKAHEAD_SZ } {
-            let b = win.peek_byte();
+            let b: u8 = win.peek_byte(0);
             let mut old_hpos = self.h.put_head_into_htab(&win);
 
             println!(
@@ -673,21 +679,24 @@ mod tests {
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
-            assert_eq!(win.peek_byte(), 1);
+            assert_eq!(win.peek_byte(0), 1);
+            assert_eq!(win.peek_byte(3), 4);
         }
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 123;
             buf.wpos = 123;
             let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
-            assert_eq!(win.peek_byte(), 1);
+            assert_eq!(win.peek_byte(0), 1);
+            assert_eq!(win.peek_byte(5), 6);
         }
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             buf.rpos = 1024 + 256 - 1;
             buf.wpos = 1024 + 256 - 1;
             let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
-            assert_eq!(win.peek_byte(), 1);
+            assert_eq!(win.peek_byte(0), 1);
+            assert_eq!(win.peek_byte(7), 8);
         }
     }
 
@@ -698,9 +707,10 @@ mod tests {
             buf.buf[0..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
             buf.wpos = 8;
             let win = buf.add_inp(&[]);
-            assert_eq!(win.peek_byte(), 1);
+            assert_eq!(win.peek_byte(0), 1);
             let win = buf.add_inp(&[9, 10, 11]);
-            assert_eq!(win.peek_byte(), 1);
+            assert_eq!(win.peek_byte(0), 1);
+            assert_eq!(win.peek_byte(8), 9);
         }
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
@@ -708,9 +718,10 @@ mod tests {
             buf.rpos = 123;
             buf.wpos = 123 + 8;
             let win = buf.add_inp(&[]);
-            assert_eq!(win.peek_byte(), 1);
+            assert_eq!(win.peek_byte(0), 1);
             let win = buf.add_inp(&[9, 10, 11]);
-            assert_eq!(win.peek_byte(), 1);
+            assert_eq!(win.peek_byte(0), 1);
+            assert_eq!(win.peek_byte(9), 10);
         }
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
@@ -719,9 +730,12 @@ mod tests {
             buf.rpos = 1024 + 256 - 4;
             buf.wpos = 4;
             let win = buf.add_inp(&[]);
-            assert_eq!(win.peek_byte(), 1);
+            assert_eq!(win.peek_byte(0), 1);
+            assert_eq!(win.peek_byte(5), 6);
             let win = buf.add_inp(&[9, 10, 11]);
-            assert_eq!(win.peek_byte(), 1);
+            assert_eq!(win.peek_byte(0), 1);
+            assert_eq!(win.peek_byte(5), 6);
+            assert_eq!(win.peek_byte(10), 11);
         }
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
@@ -729,9 +743,10 @@ mod tests {
             buf.rpos = 1024 + 256 - 1;
             buf.wpos = 0;
             let win = buf.add_inp(&[]);
-            assert_eq!(win.peek_byte(), 1);
+            assert_eq!(win.peek_byte(0), 1);
             let win = buf.add_inp(&[9, 10, 11]);
-            assert_eq!(win.peek_byte(), 1);
+            assert_eq!(win.peek_byte(0), 1);
+            assert_eq!(win.peek_byte(1), 9);
         }
     }
 
@@ -1110,7 +1125,7 @@ mod tests {
     fn hashing_inp() {
         let mut lz: Box<LZEngine<4, 1, 5, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
             LZEngine::new_boxed();
-        let mut win = lz.sbuf.add_inp(&[0x12, 0x34, 0x56, 0x78]);
+        let mut win = lz.sbuf.add_inp(&[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc]);
 
         lz.h.put_head_into_htab(&win);
 
@@ -1120,20 +1135,32 @@ mod tests {
         lz.h.put_head_into_htab(&win);
         win.roll_window(1);
         lz.h.put_head_into_htab(&win);
+        win.roll_window(1);
+        lz.h.put_head_into_htab(&win);
+        win.roll_window(1);
+        lz.h.put_head_into_htab(&win);
 
-        assert_eq!(lz.h.htab[0x12], 0);
-        assert_eq!(lz.h.htab[(0x12 << 5) ^ 0x34], 1);
-        assert_eq!(lz.h.htab[(0x12 << 10) ^ (0x34 << 5) ^ 0x56], 2);
-        assert_eq!(lz.h.htab[(0x14 << 10) ^ (0x56 << 5) ^ 0x78], 3);
+        assert_eq!(lz.h.htab[0], 0); // XXX bogus
+        assert_eq!(lz.h.htab[0x78], 1);
+        assert_eq!(lz.h.htab[(0x78 << 5) ^ 0x9a], 2);
+        assert_eq!(lz.h.htab[(0x18 << 10) ^ (0x9a << 5) ^ 0xbc], 3);
+        assert_eq!(lz.h.htab[(0x1a << 10) ^ (0xbc << 5)], 4); // end
+        assert_eq!(lz.h.htab[(0x1c << 10)], 5); // end
     }
 
     #[test]
     fn hashing_inp_with_chaining() {
         let mut lz: Box<LZEngine<4, 1, 5, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
             LZEngine::new_boxed();
-        let mut win = lz
-            .sbuf
-            .add_inp(&[0b000_00_001, 0b001_00_001, 0b001_00_010, 0b010_00_010]);
+        let mut win = lz.sbuf.add_inp(&[
+            0,
+            0,
+            0,
+            0b000_00_001,
+            0b001_00_001,
+            0b001_00_010,
+            0b010_00_010,
+        ]);
 
         lz.h.put_head_into_htab(&win);
 
@@ -1143,13 +1170,16 @@ mod tests {
         lz.h.put_head_into_htab(&win);
         win.roll_window(1);
         lz.h.put_head_into_htab(&win);
+        win.roll_window(1);
+        lz.h.put_head_into_htab(&win);
 
-        assert_eq!(lz.h.htab[1], 1);
-        assert_eq!(lz.h.htab[2], 3);
-        assert_eq!(lz.h.prev[1], 0);
-        assert_eq!(lz.h.prev[0], u64::MAX);
-        assert_eq!(lz.h.prev[3], 2);
-        assert_eq!(lz.h.prev[2], u64::MAX);
+        assert_eq!(lz.h.htab[0], 0); // XXX bogus
+        assert_eq!(lz.h.htab[1], 2);
+        assert_eq!(lz.h.htab[2], 4);
+        assert_eq!(lz.h.prev[2], 1);
+        assert_eq!(lz.h.prev[1], u64::MAX);
+        assert_eq!(lz.h.prev[4], 3);
+        assert_eq!(lz.h.prev[3], u64::MAX);
     }
 
     #[test]
