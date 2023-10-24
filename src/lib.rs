@@ -4,6 +4,21 @@ use sliding_window::SlidingWindowBuf;
 mod hashtables;
 use hashtables::HashBits;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LZSettings {
+    pub good_enough_match_len: u64,
+    pub max_prev_chain_follows: u64,
+}
+
+impl Default for LZSettings {
+    fn default() -> Self {
+        Self {
+            good_enough_match_len: u64::MAX,
+            max_prev_chain_follows: u64::MAX,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum LZOutput {
     Lit(u8),
@@ -85,8 +100,13 @@ impl<
         }
     }
 
-    pub fn compress<O>(&mut self, inp: &[u8], end_of_stream: bool, mut outp: O)
-    where
+    pub fn compress<O>(
+        &mut self,
+        settings: &LZSettings,
+        inp: &[u8],
+        end_of_stream: bool,
+        mut outp: O,
+    ) where
         O: FnMut(LZOutput),
     {
         let mut win = self.sbuf.add_inp(inp);
@@ -157,6 +177,8 @@ impl<
             let mut old_hpos = self.h.put_head_into_htab(&win);
             println!("hash pointer is {:08X}", old_hpos);
 
+            let mut prev_follow_limit = settings.max_prev_chain_follows;
+
             // initialize to an invalid value
             let mut best_match_len = MIN_MATCH - 1;
             let mut best_match_pos = u64::MAX;
@@ -169,7 +191,11 @@ impl<
             // a match within range
             // (we can terminate immediately because the prev chain only ever goes
             // further and further backwards)
-            while old_hpos != u64::MAX && old_hpos + (LOOKBACK_SZ as u64) >= win.cursor_pos() {
+            while prev_follow_limit > 0
+                && old_hpos != u64::MAX
+                && old_hpos + (LOOKBACK_SZ as u64) >= win.cursor_pos()
+            {
+                prev_follow_limit -= 1;
                 let eval_hpos = old_hpos;
                 println!("probing at {:08X}", eval_hpos);
                 old_hpos = self.h.prev[(old_hpos & ((1 << DICT_BITS) - 1)) as usize];
@@ -189,6 +215,9 @@ impl<
                     if match_len > best_match_len {
                         best_match_len = match_len;
                         best_match_pos = eval_hpos;
+                        if match_len as u64 >= settings.good_enough_match_len {
+                            break;
+                        }
                     }
                 }
             }
@@ -237,7 +266,9 @@ mod tests {
             LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
-        lz.compress(&[0x12, 0x34, 0x56], true, |x| compressed_out.push(x));
+        lz.compress(&LZSettings::default(), &[0x12, 0x34, 0x56], true, |x| {
+            compressed_out.push(x)
+        });
 
         assert_eq!(compressed_out.len(), 3);
         assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
@@ -251,9 +282,13 @@ mod tests {
             LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
-        lz.compress(&[0x12], false, |x| compressed_out.push(x));
+        lz.compress(&LZSettings::default(), &[0x12], false, |x| {
+            compressed_out.push(x)
+        });
         println!("compress 1");
-        lz.compress(&[0x34, 0x56], true, |x| compressed_out.push(x));
+        lz.compress(&LZSettings::default(), &[0x34, 0x56], true, |x| {
+            compressed_out.push(x)
+        });
         println!("compress 2");
 
         assert_eq!(compressed_out.len(), 3);
@@ -268,9 +303,12 @@ mod tests {
             LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
-        lz.compress(&[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc], true, |x| {
-            compressed_out.push(x)
-        });
+        lz.compress(
+            &LZSettings::default(),
+            &[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc],
+            true,
+            |x| compressed_out.push(x),
+        );
 
         assert_eq!(compressed_out.len(), 6);
         assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
@@ -287,9 +325,12 @@ mod tests {
             LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
-        lz.compress(&[0x12, 0x34, 0x56, 0x12, 0x34, 0x56], true, |x| {
-            compressed_out.push(x)
-        });
+        lz.compress(
+            &LZSettings::default(),
+            &[0x12, 0x34, 0x56, 0x12, 0x34, 0x56],
+            true,
+            |x| compressed_out.push(x),
+        );
 
         assert_eq!(compressed_out.len(), 4);
         assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
@@ -305,6 +346,7 @@ mod tests {
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
+            &LZSettings::default(),
             &[0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56],
             true,
             |x| compressed_out.push(x),
@@ -324,6 +366,7 @@ mod tests {
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
+            &LZSettings::default(),
             &[
                 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34,
                 0x56, 0x12, 0x34, 0x56,
@@ -346,15 +389,19 @@ mod tests {
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
+            &LZSettings::default(),
             &[
                 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56,
             ],
             false,
             |x| compressed_out.push(x),
         );
-        lz.compress(&[0x12, 0x34, 0x56, 0x12, 0x34, 0x56], true, |x| {
-            compressed_out.push(x)
-        });
+        lz.compress(
+            &LZSettings::default(),
+            &[0x12, 0x34, 0x56, 0x12, 0x34, 0x56],
+            true,
+            |x| compressed_out.push(x),
+        );
 
         assert_eq!(compressed_out.len(), 5);
         assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
@@ -371,15 +418,19 @@ mod tests {
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
+            &LZSettings::default(),
             &[
                 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12,
             ],
             false,
             |x| compressed_out.push(x),
         );
-        lz.compress(&[0x34, 0x56, 0x12, 0x34, 0x56], true, |x| {
-            compressed_out.push(x)
-        });
+        lz.compress(
+            &LZSettings::default(),
+            &[0x34, 0x56, 0x12, 0x34, 0x56],
+            true,
+            |x| compressed_out.push(x),
+        );
 
         assert_eq!(compressed_out.len(), 5);
         assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
@@ -418,15 +469,19 @@ mod tests {
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
+            &LZSettings::default(),
             &[
                 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
             ],
             false,
             |x| compressed_out.push(x),
         );
-        lz.compress(&[0x34, 0x56, 0x12, 0x34, 0x56, 0xde], true, |x| {
-            compressed_out.push(x)
-        });
+        lz.compress(
+            &LZSettings::default(),
+            &[0x34, 0x56, 0x12, 0x34, 0x56, 0xde],
+            true,
+            |x| compressed_out.push(x),
+        );
 
         assert_eq!(compressed_out.len(), 9);
         assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
@@ -487,7 +542,9 @@ mod tests {
             LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
-        lz.compress(&inp, true, |x| compressed_out.push(x));
+        lz.compress(&LZSettings::default(), &inp, true, |x| {
+            compressed_out.push(x)
+        });
 
         let mut outp_f = BufWriter::new(File::create(outp_fn).unwrap());
         for &lz_tok in &compressed_out {
@@ -539,9 +596,13 @@ mod tests {
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         for i in 0..inp.len() {
-            lz.compress(&[inp[i]], false, |x| compressed_out.push(x));
+            lz.compress(&LZSettings::default(), &[inp[i]], false, |x| {
+                compressed_out.push(x)
+            });
         }
-        lz.compress(&[], true, |x| compressed_out.push(x));
+        lz.compress(&LZSettings::default(), &[], true, |x| {
+            compressed_out.push(x)
+        });
 
         let mut outp_f = BufWriter::new(File::create(outp_fn).unwrap());
         for &lz_tok in &compressed_out {
