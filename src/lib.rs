@@ -1,3 +1,4 @@
+#[repr(C)] // not sure if we need this because of padding bytes / uninitialized memory?
 struct SlidingWindowBuf<
     const LOOKBACK_SZ: usize,
     const LOOKAHEAD_SZ: usize,
@@ -25,6 +26,15 @@ impl<const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: usiz
             wpos: 0,
             rpos_real_offs: 0,
         }
+    }
+    unsafe fn initialize_at(p: *mut Self) {
+        let p_buf = core::ptr::addr_of_mut!((*p).buf);
+        for i in 0..TOT_BUF_SZ {
+            (*p_buf)[i] = 0;
+        }
+        (*p).rpos = 0;
+        (*p).wpos = 0;
+        (*p).rpos_real_offs = 0;
     }
 
     fn add_inp<'a>(
@@ -207,6 +217,7 @@ enum LZOutput {
     Ref { disp: u64, len: u64 },
 }
 
+#[repr(C)] // not sure if we need this because of padding bytes / uninitialized memory?
 struct HashBits<
     const MIN_MATCH: u64,
     const HASH_BITS: usize,
@@ -230,19 +241,49 @@ impl<
 {
     fn new() -> Self {
         Self {
-            htab: [0; HASH_SZ],
-            prev: [0; DICT_SZ],
+            htab: [u64::MAX; HASH_SZ],
+            prev: [u64::MAX; DICT_SZ],
             initial_lits_done: 0,
             hash_of_head: 0,
         }
+    }
+    unsafe fn initialize_at(p: *mut Self) {
+        let p_htab = core::ptr::addr_of_mut!((*p).htab);
+        for i in 0..HASH_SZ {
+            // my understanding is that this is safe because u64 doesn't have Drop
+            // and we don't construct a & anywhere
+            (*p_htab)[i] = u64::MAX;
+        }
+        let p_prev = core::ptr::addr_of_mut!((*p).prev);
+        for i in 0..DICT_SZ {
+            (*p_prev)[i] = u64::MAX;
+        }
+        (*p).initial_lits_done = 0;
+        (*p).hash_of_head = 0;
     }
     fn calc_new_hash(&self, old_hash: u32, b: u8) -> u32 {
         let hash_shift = ((HASH_BITS as u64) + MIN_MATCH - 1) / MIN_MATCH;
         let hash = (old_hash << hash_shift) ^ (b as u32);
         hash & ((1 << HASH_BITS) - 1)
     }
+    fn put_head_into_htab<
+        const LOOKBACK_SZ: usize,
+        const LOOKAHEAD_SZ: usize,
+        const TOT_BUF_SZ: usize,
+    >(
+        &mut self,
+        win: &SlidingWindow<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ>,
+    ) {
+        let b = win.peek_byte();
+        self.hash_of_head = self.calc_new_hash(self.hash_of_head, b);
+        let old_hpos = self.htab[self.hash_of_head as usize];
+        self.htab[self.hash_of_head as usize] = win.buf.rpos_real_offs;
+        let prev_idx = win.buf.rpos_real_offs & ((1 << DICT_BITS) - 1);
+        self.prev[prev_idx as usize] = old_hpos;
+    }
 }
 
+#[repr(C)] // not sure if we need this because of padding bytes / uninitialized memory?
 struct LZEngine<
     const LOOKBACK_SZ: usize,
     const LOOKAHEAD_SZ: usize,
@@ -295,15 +336,23 @@ impl<
             h: HashBits::new(),
         }
     }
+    fn new_boxed() -> Box<Self> {
+        unsafe {
+            let layout = core::alloc::Layout::new::<Self>();
+            let p = std::alloc::alloc(layout) as *mut Self;
+            SlidingWindowBuf::initialize_at(core::ptr::addr_of_mut!((*p).sbuf));
+            HashBits::initialize_at(core::ptr::addr_of_mut!((*p).h));
+            Box::from_raw(p)
+        }
+    }
 
-    fn compres<O>(&mut self, inp: &[u8], mut outp: O)
+    fn compress<O>(&mut self, inp: &[u8], mut outp: O)
     where
         O: FnMut(LZOutput),
     {
-        let (mut sbuf, mut h) = (&mut self.sbuf, &mut self.h);
-        let mut win = sbuf.add_inp(inp);
+        let mut win = self.sbuf.add_inp(inp);
 
-        while h.initial_lits_done < MIN_MATCH {
+        while self.h.initial_lits_done < MIN_MATCH {
             // the first MIN_MATCH bytes can never be compressed as a backreference,
             // and we need to prime the hash table
             if win.tot_ahead_sz() == 0 {
@@ -311,8 +360,8 @@ impl<
             }
             let b = win.peek_byte();
             outp(LZOutput::Lit(b));
-            h.hash_of_head = h.calc_new_hash(h.hash_of_head, b);
-            h.initial_lits_done += 1;
+            self.h.put_head_into_htab(&win);
+            self.h.initial_lits_done += 1;
         }
     }
 }
@@ -905,5 +954,51 @@ mod tests {
         assert_eq!(h, (0x72 << 8) ^ (0x34 << 4) ^ 0x56);
         let h = hb.calc_new_hash(h, 0x78);
         assert_eq!(h, (0x2 << 12) ^ (0x34 << 8) ^ (0x56 << 4) ^ 0x78);
+    }
+
+    #[test]
+    fn hashing_inp() {
+        let mut lz: Box<LZEngine<1, 0, 1, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
+            LZEngine::new_boxed();
+        let mut win = lz.sbuf.add_inp(&[0x12, 0x34, 0x56, 0x78]);
+
+        lz.h.put_head_into_htab(&win);
+
+        win.roll_window(1);
+        lz.h.put_head_into_htab(&win);
+        win.roll_window(1);
+        lz.h.put_head_into_htab(&win);
+        win.roll_window(1);
+        lz.h.put_head_into_htab(&win);
+
+        assert_eq!(lz.h.htab[0x12], 0);
+        assert_eq!(lz.h.htab[(0x12 << 5) ^ 0x34], 1);
+        assert_eq!(lz.h.htab[(0x12 << 10) ^ (0x34 << 5) ^ 0x56], 2);
+        assert_eq!(lz.h.htab[(0x14 << 10) ^ (0x56 << 5) ^ 0x78], 3);
+    }
+
+    #[test]
+    fn hashing_inp_with_chaining() {
+        let mut lz: Box<LZEngine<1, 0, 1, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
+            LZEngine::new_boxed();
+        let mut win = lz
+            .sbuf
+            .add_inp(&[0b000_00_001, 0b001_00_001, 0b001_00_010, 0b010_00_010]);
+
+        lz.h.put_head_into_htab(&win);
+
+        win.roll_window(1);
+        lz.h.put_head_into_htab(&win);
+        win.roll_window(1);
+        lz.h.put_head_into_htab(&win);
+        win.roll_window(1);
+        lz.h.put_head_into_htab(&win);
+
+        assert_eq!(lz.h.htab[1], 1);
+        assert_eq!(lz.h.htab[2], 3);
+        assert_eq!(lz.h.prev[1], 0);
+        assert_eq!(lz.h.prev[0], u64::MAX);
+        assert_eq!(lz.h.prev[3], 2);
+        assert_eq!(lz.h.prev[2], u64::MAX);
     }
 }
