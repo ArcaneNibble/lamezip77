@@ -312,7 +312,8 @@ struct HashBits<
     htab: [u64; HASH_SZ],
     prev: [u64; DICT_SZ],
     hash_of_head: u32,
-    initial_lits_done: bool,
+    redo_hash_at_cursor: bool,
+    redo_hash_behind_cursor_num_missing: u8,
 }
 
 impl<
@@ -328,7 +329,8 @@ impl<
             htab: [u64::MAX; HASH_SZ],
             prev: [u64::MAX; DICT_SZ],
             hash_of_head: 0,
-            initial_lits_done: false,
+            redo_hash_at_cursor: true,
+            redo_hash_behind_cursor_num_missing: 0,
         }
     }
     unsafe fn initialize_at(p: *mut Self) {
@@ -343,7 +345,8 @@ impl<
             (*p_prev)[i] = u64::MAX;
         }
         (*p).hash_of_head = 0;
-        (*p).initial_lits_done = false;
+        (*p).redo_hash_at_cursor = true;
+        (*p).redo_hash_behind_cursor_num_missing = 0;
     }
     fn calc_new_hash(&self, old_hash: u32, b: u8) -> u32 {
         let hash_shift = (HASH_BITS + MIN_MATCH - 1) / MIN_MATCH;
@@ -383,7 +386,12 @@ impl<
                 cur_offs + i as u64,
                 self.hash_of_head
             );
-            self.put_raw_into_htab(self.hash_of_head, cur_offs + i as u64);
+
+            if i + MIN_MATCH <= span.len() {
+                self.put_raw_into_htab(self.hash_of_head, cur_offs + i as u64);
+            } else {
+                println!("span -- skipping htab update, out of range")
+            }
 
             if i + MIN_MATCH < span.len() {
                 let b = span[i + MIN_MATCH];
@@ -442,6 +450,7 @@ impl<
         assert_eq!(DICT_SZ, 1 << DICT_BITS);
         assert!(MIN_DISP >= 1);
         assert!(MIN_MATCH >= 1);
+        assert!(MIN_MATCH <= u8::MAX as usize);
         // this condition is required so that we can actually calculate hash
         assert!(LOOKAHEAD_SZ >= MIN_MATCH);
         assert!(HASH_BITS <= 32);
@@ -456,6 +465,7 @@ impl<
         assert_eq!(DICT_SZ, 1 << DICT_BITS);
         assert!(MIN_DISP >= 1);
         assert!(MIN_MATCH >= 1);
+        assert!(MIN_MATCH <= u8::MAX as usize);
         // this condition is required so that we can actually calculate hash
         assert!(LOOKAHEAD_SZ >= MIN_MATCH);
         assert!(HASH_BITS <= 32);
@@ -475,45 +485,57 @@ impl<
     {
         let mut win = self.sbuf.add_inp(inp);
 
-        /*while self.h.initial_lits_done < MIN_MATCH {
-            // the first MIN_MATCH bytes can never be compressed as a backreference,
-            // and we need to prime the hash table
-            if win.tot_ahead_sz() == 0 {
-                return;
-            }
-            let b = win.peek_byte(0);
-            outp(LZOutput::Lit(b));
-            self.h.initial_lits_done += 1;
-            win.roll_window(1);
-        }
-
-        if self.h.initial_lits_done == MIN_MATCH {
-            // we can actually compute the initial hash now
-            let initial_bytes = win.get_next_spans(0, MIN_MATCH as usize);
-            let mut hash = 0;
-            for i in 0..(MIN_MATCH as usize) {
-                hash = self.h.calc_new_hash(hash, initial_bytes[i]);
-            }
-            self.h.hash_of_head = hash;
-        }*/
-
         // XXX is this the right condition?
         println!("tot ahead {}", win.tot_ahead_sz());
         while win.tot_ahead_sz() > if end_of_stream { 0 } else { LOOKAHEAD_SZ } {
-            if !self.h.initial_lits_done {
-                // the first MIN_MATCH bytes can never be compressed as a backreference,
-                // and we need to prime the hash table
+            if self.h.redo_hash_behind_cursor_num_missing > 0 {
+                println!(
+                    "redo behind cursor @ {:08X} # {}",
+                    win.buf.rpos_real_offs, self.h.redo_hash_behind_cursor_num_missing
+                );
+
+                // we know there is >= 1 byte always, and >= LOOKAHEAD_SZ + 1 (aka >= MIN_MATCH + 1) bytes if not EOS
+                // FIXME change EOS to flush??
+
+                let mut hash = self.h.hash_of_head;
+
+                for i in (0..self.h.redo_hash_behind_cursor_num_missing).rev() {
+                    println!("redo behind pos -{} old hash {:04X}", i, hash);
+                    // when we are in this situation, there is always one more htab update than hash update
+                    // so we start with a hash update
+                    hash = self
+                        .h
+                        .calc_new_hash(hash, win.peek_byte(MIN_MATCH - 1 - i as usize));
+
+                    if i != 0 {
+                        println!(
+                            "redo behind pos insert @ {:08X} is {:04X}",
+                            win.buf.rpos_real_offs - i as u64,
+                            hash
+                        );
+                        self.h
+                            .put_raw_into_htab(hash, win.buf.rpos_real_offs - i as u64);
+                    }
+                }
+
+                self.h.hash_of_head = hash;
+            }
+
+            if self.h.redo_hash_at_cursor {
+                println!("redo at cursor @ {:08X}", win.buf.rpos_real_offs);
+                // we need to prime the hash table by recomputing the hash for cursor
+                // either at the start or after a span
 
                 // we either have at least LOOKAHEAD_SZ + 1 bytes available
                 // (which is at least MIN_MATCH),
                 // *or* we don't but are at EOS already (very short input)
-                let initial_bytes = win.get_next_spans(0, MIN_MATCH);
+                let initial_bytes = win.get_next_spans(win.buf.rpos_real_offs, MIN_MATCH);
                 let mut hash = 0;
                 for i in 0..MIN_MATCH {
                     hash = self.h.calc_new_hash(hash, initial_bytes[i]);
                 }
                 self.h.hash_of_head = hash;
-                self.h.initial_lits_done = true;
+                self.h.redo_hash_at_cursor = false;
             }
 
             let b: u8 = win.peek_byte(0);
@@ -531,7 +553,9 @@ impl<
 
             // this is what we're matching against
             let max_match = MAX_MATCH.try_into().unwrap_or(usize::MAX);
-            let cursor_spans = win.get_next_spans(win.buf.rpos_real_offs, max_match);
+            // extra in the hopes that we don't have to recompute hash later
+            let cursor_spans =
+                win.get_next_spans(win.buf.rpos_real_offs, max_match + MIN_MATCH + 1);
 
             // a match within range
             // (we can terminate immediately because the prev chain only ever goes
@@ -571,6 +595,12 @@ impl<
                 });
                 self.h
                     .put_span_into_htab(&cursor_spans, win.buf.rpos_real_offs, best_match_len);
+                let avail_extra_bytes = cursor_spans.len() - best_match_len;
+                println!("match -- {} extra bytes", avail_extra_bytes);
+                if avail_extra_bytes < MIN_MATCH {
+                    self.h.redo_hash_behind_cursor_num_missing =
+                        (MIN_MATCH - avail_extra_bytes) as u8;
+                }
                 win.roll_window(best_match_len);
             }
         }
