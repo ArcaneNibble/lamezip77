@@ -88,6 +88,10 @@ impl<'a> core::ops::Index<usize> for SpanSet<'a> {
 }
 
 impl<'a> SpanSet<'a> {
+    fn len(&self) -> usize {
+        self.0.len() + self.1.map_or(0, |x| x.len()) + self.2.map_or(0, |x| x.len())
+    }
+
     fn compare(&self, other: &Self) -> usize {
         // todo optimizations? or can the compiler optimize this?
         let mut len = 0;
@@ -347,6 +351,14 @@ impl<
         hash & ((1 << HASH_BITS) - 1)
     }
     // returns old hashtable entry, which is a chain to follow when compressing
+    fn put_raw_into_htab(&mut self, hash: u32, offs: u64) -> u64 {
+        let old_hpos = self.htab[hash as usize];
+        self.htab[hash as usize] = offs;
+        let prev_idx = offs & ((1 << DICT_BITS) - 1);
+        self.prev[prev_idx as usize] = old_hpos;
+
+        old_hpos
+    }
     fn put_head_into_htab<
         const LOOKBACK_SZ: usize,
         const LOOKAHEAD_SZ: usize,
@@ -355,15 +367,31 @@ impl<
         &mut self,
         win: &SlidingWindow<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ>,
     ) -> u64 {
-        let old_hpos = self.htab[self.hash_of_head as usize];
-        self.htab[self.hash_of_head as usize] = win.buf.rpos_real_offs;
-        let prev_idx = win.buf.rpos_real_offs & ((1 << DICT_BITS) - 1);
-        self.prev[prev_idx as usize] = old_hpos;
+        let old_hpos = self.put_raw_into_htab(self.hash_of_head, win.buf.rpos_real_offs);
 
-        let b = win.peek_byte(MIN_MATCH as usize);
+        let b = win.peek_byte(MIN_MATCH);
         self.hash_of_head = self.calc_new_hash(self.hash_of_head, b);
 
         old_hpos
+    }
+    fn put_span_into_htab(&mut self, span: &SpanSet, cur_offs: u64, len: usize) {
+        debug_assert!(span.len() >= len);
+
+        for i in 1..len {
+            println!(
+                "span -- hash @ {:08X} is {:04X}",
+                cur_offs + i as u64,
+                self.hash_of_head
+            );
+            self.put_raw_into_htab(self.hash_of_head, cur_offs + i as u64);
+
+            if i + MIN_MATCH < span.len() {
+                let b = span[i + MIN_MATCH];
+                self.hash_of_head = self.calc_new_hash(self.hash_of_head, b);
+            } else {
+                println!("span -- skipping hash update, out of range")
+            }
+        }
     }
 }
 
@@ -479,18 +507,13 @@ impl<
                 // we either have at least LOOKAHEAD_SZ + 1 bytes available
                 // (which is at least MIN_MATCH),
                 // *or* we don't but are at EOS already (very short input)
-                let initial_bytes = win.get_next_spans(0, MIN_MATCH as usize);
+                let initial_bytes = win.get_next_spans(0, MIN_MATCH);
                 let mut hash = 0;
-                for i in 0..(MIN_MATCH as usize) {
+                for i in 0..MIN_MATCH {
                     hash = self.h.calc_new_hash(hash, initial_bytes[i]);
                 }
                 self.h.hash_of_head = hash;
                 self.h.initial_lits_done = true;
-
-                // let b = win.peek_byte(0);
-                // outp(LZOutput::Lit(b));
-                // self.h.initial_lits_done += 1;
-                // win.roll_window(1);
             }
 
             let b: u8 = win.peek_byte(0);
@@ -506,6 +529,10 @@ impl<
             let mut best_match_len = MIN_MATCH - 1;
             let mut best_match_pos = u64::MAX;
 
+            // this is what we're matching against
+            let max_match = MAX_MATCH.try_into().unwrap_or(usize::MAX);
+            let cursor_spans = win.get_next_spans(win.buf.rpos_real_offs, max_match);
+
             // a match within range
             // (we can terminate immediately because the prev chain only ever goes
             // further and further backwards)
@@ -519,11 +546,9 @@ impl<
                     continue;
                 }
 
-                // TODO many optimizations here
-                let max_match = MAX_MATCH.try_into().unwrap_or(usize::MAX);
                 let lookback_spans = win.get_next_spans(eval_hpos, max_match);
-                let cursor_spans = win.get_next_spans(win.buf.rpos_real_offs, max_match);
 
+                // TODO many optimizations here
                 let match_len = lookback_spans.compare(&cursor_spans);
                 debug_assert!(match_len <= MAX_MATCH);
                 if match_len >= MIN_MATCH {
@@ -544,6 +569,8 @@ impl<
                     disp: win.buf.rpos_real_offs - best_match_pos,
                     len: best_match_len as u64,
                 });
+                self.h
+                    .put_span_into_htab(&cursor_spans, win.buf.rpos_real_offs, best_match_len);
                 win.roll_window(best_match_len);
             }
         }
@@ -1336,5 +1363,52 @@ mod tests {
         assert_eq!(compressed_out[1], LZOutput::Lit(0x34));
         assert_eq!(compressed_out[2], LZOutput::Lit(0x56));
         assert_eq!(compressed_out[3], LZOutput::Ref { disp: 3, len: 6 });
+    }
+
+    #[test]
+    fn lz_longer_than_lookahead_repeat() {
+        let mut lz: Box<
+            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        lz.compress(
+            &[
+                0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34,
+                0x56, 0x12, 0x34, 0x56,
+            ],
+            true,
+            |x| compressed_out.push(x),
+        );
+
+        assert_eq!(compressed_out.len(), 4);
+        assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
+        assert_eq!(compressed_out[1], LZOutput::Lit(0x34));
+        assert_eq!(compressed_out[2], LZOutput::Lit(0x56));
+        assert_eq!(compressed_out[3], LZOutput::Ref { disp: 3, len: 15 });
+    }
+
+    #[test]
+    fn lz_split_repeat() {
+        let mut lz: Box<
+            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        lz.compress(
+            &[
+                0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56,
+            ],
+            false,
+            |x| compressed_out.push(x),
+        );
+        lz.compress(&[0x12, 0x34, 0x56, 0x12, 0x34, 0x56], true, |x| {
+            compressed_out.push(x)
+        });
+
+        assert_eq!(compressed_out.len(), 5);
+        assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
+        assert_eq!(compressed_out[1], LZOutput::Lit(0x34));
+        assert_eq!(compressed_out[2], LZOutput::Lit(0x56));
+        assert_eq!(compressed_out[3], LZOutput::Ref { disp: 3, len: 9 });
+        assert_eq!(compressed_out[4], LZOutput::Ref { disp: 3, len: 6 });
     }
 }
