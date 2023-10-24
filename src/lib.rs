@@ -7,6 +7,7 @@ use hashtables::HashBits;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LZSettings {
     pub good_enough_match_len: u64,
+    pub max_insert_all_match_len: u64,
     pub max_prev_chain_follows: u64,
 }
 
@@ -14,6 +15,7 @@ impl Default for LZSettings {
     fn default() -> Self {
         Self {
             good_enough_match_len: u64::MAX,
+            max_insert_all_match_len: u64::MAX,
             max_prev_chain_follows: u64::MAX,
         }
     }
@@ -157,10 +159,9 @@ impl<
                 // we either have at least LOOKAHEAD_SZ + 1 bytes available
                 // (which is at least MIN_MATCH),
                 // *or* we don't but are at EOS already (very short input)
-                let initial_bytes = win.get_next_spans(win.cursor_pos(), MIN_MATCH);
                 let mut hash = 0;
                 for i in 0..MIN_MATCH {
-                    hash = self.h.calc_new_hash(hash, initial_bytes[i]);
+                    hash = self.h.calc_new_hash(hash, win.peek_byte(i));
                 }
                 self.h.hash_of_head = hash;
                 self.h.redo_hash_at_cursor = false;
@@ -232,13 +233,17 @@ impl<
                     disp: win.cursor_pos() - best_match_pos,
                     len: best_match_len as u64,
                 });
-                self.h
-                    .put_span_into_htab(&cursor_spans, win.cursor_pos(), best_match_len);
-                let avail_extra_bytes = cursor_spans.len() - best_match_len;
-                println!("match -- {} extra bytes", avail_extra_bytes);
-                if avail_extra_bytes < MIN_MATCH {
-                    self.h.redo_hash_behind_cursor_num_missing =
-                        (MIN_MATCH - avail_extra_bytes) as u8;
+                if best_match_len as u64 <= settings.max_insert_all_match_len {
+                    self.h
+                        .put_span_into_htab(&cursor_spans, win.cursor_pos(), best_match_len);
+                    let avail_extra_bytes = cursor_spans.len() - best_match_len;
+                    println!("match -- {} extra bytes", avail_extra_bytes);
+                    if avail_extra_bytes < MIN_MATCH {
+                        self.h.redo_hash_behind_cursor_num_missing =
+                            (MIN_MATCH - avail_extra_bytes) as u8;
+                    }
+                } else {
+                    self.h.redo_hash_at_cursor = true;
                 }
                 win.roll_window(best_match_len);
             }
@@ -638,5 +643,32 @@ mod tests {
         }
 
         assert_eq!(inp, decompress);
+    }
+
+    #[test]
+    fn lz_max_insert_len() {
+        let mut settings = LZSettings::default();
+        settings.max_insert_all_match_len = 4;
+
+        let mut lz: Box<
+            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        lz.compress(
+            &settings,
+            &[
+                0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56,
+            ],
+            true,
+            |x| compressed_out.push(x),
+        );
+
+        assert_eq!(compressed_out.len(), 6);
+        assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
+        assert_eq!(compressed_out[1], LZOutput::Lit(0x34));
+        assert_eq!(compressed_out[2], LZOutput::Lit(0x56));
+        assert_eq!(compressed_out[3], LZOutput::Ref { disp: 3, len: 6 });
+        assert_eq!(compressed_out[4], LZOutput::Lit(0x78));
+        assert_eq!(compressed_out[5], LZOutput::Ref { disp: 7, len: 3 });
     }
 }
