@@ -307,8 +307,8 @@ struct HashBits<
 > {
     htab: [u64; HASH_SZ],
     prev: [u64; DICT_SZ],
-    initial_lits_done: u64,
     hash_of_head: u32,
+    initial_lits_done: bool,
 }
 
 impl<
@@ -323,8 +323,8 @@ impl<
         Self {
             htab: [u64::MAX; HASH_SZ],
             prev: [u64::MAX; DICT_SZ],
-            initial_lits_done: 0,
             hash_of_head: 0,
+            initial_lits_done: false,
         }
     }
     unsafe fn initialize_at(p: *mut Self) {
@@ -338,8 +338,8 @@ impl<
         for i in 0..DICT_SZ {
             (*p_prev)[i] = u64::MAX;
         }
-        (*p).initial_lits_done = 0;
         (*p).hash_of_head = 0;
+        (*p).initial_lits_done = false;
     }
     fn calc_new_hash(&self, old_hash: u32, b: u8) -> u32 {
         let hash_shift = ((HASH_BITS as u64) + MIN_MATCH - 1) / MIN_MATCH;
@@ -474,13 +474,34 @@ impl<
         // XXX is this the right condition?
         println!("tot ahead {}", win.tot_ahead_sz());
         while win.tot_ahead_sz() > if end_of_stream { 0 } else { LOOKAHEAD_SZ } {
-            let b: u8 = win.peek_byte(0);
-            let mut old_hpos = self.h.put_head_into_htab(&win);
+            if !self.h.initial_lits_done {
+                // the first MIN_MATCH bytes can never be compressed as a backreference,
+                // and we need to prime the hash table
 
+                // we either have at least LOOKAHEAD_SZ + 1 bytes available
+                // (which is at least MIN_MATCH),
+                // *or* we don't but are at EOS already (very short input)
+                let initial_bytes = win.get_next_spans(0, MIN_MATCH as usize);
+                let mut hash = 0;
+                for i in 0..(MIN_MATCH as usize) {
+                    hash = self.h.calc_new_hash(hash, initial_bytes[i]);
+                }
+                self.h.hash_of_head = hash;
+                self.h.initial_lits_done = true;
+
+                // let b = win.peek_byte(0);
+                // outp(LZOutput::Lit(b));
+                // self.h.initial_lits_done += 1;
+                // win.roll_window(1);
+            }
+
+            let b: u8 = win.peek_byte(0);
             println!(
                 "working @ {:08X} with val {:02X} cur hash {:04X}",
                 win.buf.rpos_real_offs, b, self.h.hash_of_head
             );
+
+            let mut old_hpos = self.h.put_head_into_htab(&win);
             println!("hash pointer is {:08X}", old_hpos);
 
             // initialize to an invalid value
