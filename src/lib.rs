@@ -1441,4 +1441,114 @@ mod tests {
         assert_eq!(compressed_out[3], LZOutput::Ref { disp: 3, len: 9 });
         assert_eq!(compressed_out[4], LZOutput::Ref { disp: 3, len: 6 });
     }
+
+    #[test]
+    fn lz_detailed_backref_hashing() {
+        let mut lz: Box<
+            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        lz.compress(
+            &[
+                0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12,
+            ],
+            false,
+            |x| compressed_out.push(x),
+        );
+        lz.compress(&[0x34, 0x56, 0x12, 0x34, 0x56], true, |x| {
+            compressed_out.push(x)
+        });
+
+        assert_eq!(compressed_out.len(), 5);
+        assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
+        assert_eq!(compressed_out[1], LZOutput::Lit(0x34));
+        assert_eq!(compressed_out[2], LZOutput::Lit(0x56));
+        assert_eq!(compressed_out[3], LZOutput::Ref { disp: 3, len: 10 });
+        assert_eq!(compressed_out[4], LZOutput::Ref { disp: 3, len: 5 });
+
+        assert_eq!(lz.h.htab[(0x12 << 10) ^ (0x34 << 5) ^ 0x56], 15);
+        assert_eq!(lz.h.prev[15], 12);
+        assert_eq!(lz.h.prev[12], 9);
+        assert_eq!(lz.h.prev[9], 6);
+        assert_eq!(lz.h.prev[6], 3);
+        assert_eq!(lz.h.prev[3], 0);
+        assert_eq!(lz.h.prev[0], u64::MAX);
+
+        assert_eq!(lz.h.htab[(0x14 << 10) ^ (0x56 << 5) ^ 0x12], 13);
+        assert_eq!(lz.h.prev[13], 10);
+        assert_eq!(lz.h.prev[10], 7);
+        assert_eq!(lz.h.prev[7], 4);
+        assert_eq!(lz.h.prev[4], 1);
+        assert_eq!(lz.h.prev[1], u64::MAX);
+
+        assert_eq!(lz.h.htab[(0x16 << 10) ^ (0x12 << 5) ^ 0x34], 14);
+        assert_eq!(lz.h.prev[14], 11);
+        assert_eq!(lz.h.prev[11], 8);
+        assert_eq!(lz.h.prev[8], 5);
+        assert_eq!(lz.h.prev[5], 2);
+        assert_eq!(lz.h.prev[2], u64::MAX);
+    }
+
+    #[test]
+    fn lz_peek_ahead_after_span() {
+        let mut lz: Box<
+            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        lz.compress(
+            &[
+                0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
+            ],
+            false,
+            |x| compressed_out.push(x),
+        );
+        lz.compress(&[0x34, 0x56, 0x12, 0x34, 0x56, 0xde], true, |x| {
+            compressed_out.push(x)
+        });
+
+        assert_eq!(compressed_out.len(), 9);
+        assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
+        assert_eq!(compressed_out[1], LZOutput::Lit(0x34));
+        assert_eq!(compressed_out[2], LZOutput::Lit(0x56));
+        assert_eq!(compressed_out[3], LZOutput::Ref { disp: 3, len: 6 });
+        assert_eq!(compressed_out[4], LZOutput::Lit(0x78));
+        assert_eq!(compressed_out[5], LZOutput::Lit(0x9a));
+        assert_eq!(compressed_out[6], LZOutput::Lit(0xbc));
+        assert_eq!(compressed_out[7], LZOutput::Ref { disp: 8, len: 5 });
+        assert_eq!(compressed_out[8], LZOutput::Lit(0xde));
+
+        assert_eq!(lz.h.htab[(0x12 << 10) ^ (0x34 << 5) ^ 0x56], 14);
+        assert_eq!(lz.h.prev[14], 6);
+        assert_eq!(lz.h.prev[6], 3);
+        assert_eq!(lz.h.prev[3], 0);
+        assert_eq!(lz.h.prev[0], u64::MAX);
+
+        assert_eq!(lz.h.htab[(0x14 << 10) ^ (0x56 << 5) ^ 0x12], 12);
+        assert_eq!(lz.h.prev[12], 4);
+        assert_eq!(lz.h.prev[4], 1);
+        assert_eq!(lz.h.prev[1], u64::MAX);
+
+        assert_eq!(lz.h.htab[(0x16 << 10) ^ (0x12 << 5) ^ 0x34], 13);
+        assert_eq!(lz.h.prev[13], 5);
+        assert_eq!(lz.h.prev[5], 2);
+        assert_eq!(lz.h.prev[2], u64::MAX);
+
+        assert_eq!(lz.h.htab[(0x14 << 10) ^ (0x56 << 5) ^ 0x78], 7);
+        assert_eq!(lz.h.prev[7], u64::MAX);
+
+        assert_eq!(lz.h.htab[(0x14 << 10) ^ (0x56 << 5) ^ 0xde], 15);
+        assert_eq!(lz.h.prev[15], u64::MAX);
+
+        assert_eq!(lz.h.htab[(0x16 << 10) ^ (0x78 << 5) ^ 0x9a], 8);
+        assert_eq!(lz.h.prev[8], u64::MAX);
+
+        assert_eq!(lz.h.htab[(0x18 << 10) ^ (0x9a << 5) ^ 0xbc], 9);
+        assert_eq!(lz.h.prev[9], u64::MAX);
+
+        assert_eq!(lz.h.htab[(0x1a << 10) ^ (0xbc << 5) ^ 0x34], 10);
+        assert_eq!(lz.h.prev[10], u64::MAX);
+
+        assert_eq!(lz.h.htab[(0x1c << 10) ^ (0x34 << 5) ^ 0x56], 11);
+        assert_eq!(lz.h.prev[11], u64::MAX);
+    }
 }
