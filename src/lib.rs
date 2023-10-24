@@ -192,7 +192,12 @@ impl<'a, const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: 
         } else {
             let (sz_from_internal_buf, sz_from_external_buf) =
                 if dist_to_look_forward <= lookahead_valid_sz {
-                    (dist_to_look_back + dist_to_look_forward, 0)
+                    (
+                        // always from the internal buf, but how much?
+                        // limited to bytes
+                        core::cmp::min(dist_to_look_back + dist_to_look_forward, bytes),
+                        0,
+                    )
                 } else {
                     (
                         dist_to_look_back + lookahead_valid_sz,
@@ -508,16 +513,19 @@ impl<
                         .calc_new_hash(hash, win.peek_byte(MIN_MATCH - 1 - i as usize));
 
                     if i != 0 {
-                        println!(
-                            "redo behind pos insert @ {:08X} is {:04X}",
-                            win.buf.rpos_real_offs - i as u64,
-                            hash
-                        );
-                        self.h
+                        let old_hpos = self
+                            .h
                             .put_raw_into_htab(hash, win.buf.rpos_real_offs - i as u64);
+                        println!(
+                            "redo behind pos insert @ {:08X} is {:04X} old {:08X}",
+                            win.buf.rpos_real_offs - i as u64,
+                            hash,
+                            old_hpos
+                        );
                     }
                 }
 
+                self.h.redo_hash_behind_cursor_num_missing = 0;
                 self.h.hash_of_head = hash;
             }
 
@@ -563,6 +571,7 @@ impl<
             while old_hpos != u64::MAX && old_hpos + (LOOKBACK_SZ as u64) >= win.buf.rpos_real_offs
             {
                 let eval_hpos = old_hpos;
+                println!("probing at {:08X}", eval_hpos);
                 old_hpos = self.h.prev[(old_hpos & ((1 << DICT_BITS) - 1)) as usize];
 
                 if !(eval_hpos + MIN_DISP <= win.buf.rpos_real_offs) {
@@ -574,6 +583,7 @@ impl<
 
                 // TODO many optimizations here
                 let match_len = lookback_spans.compare(&cursor_spans);
+                println!("match len {} span len {}", match_len, lookback_spans.len());
                 debug_assert!(match_len <= MAX_MATCH);
                 if match_len >= MIN_MATCH {
                     if match_len > best_match_len {
@@ -615,6 +625,11 @@ impl<
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::File,
+        io::{BufWriter, Write},
+    };
+
     use super::*;
 
     #[test]
@@ -1550,5 +1565,106 @@ mod tests {
 
         assert_eq!(lz.h.htab[(0x1c << 10) ^ (0x34 << 5) ^ 0x56], 11);
         assert_eq!(lz.h.prev[11], u64::MAX);
+    }
+
+    #[test]
+    fn lz_big_file() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("src/lib.rs");
+        let outp_fn = d.join("test.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut lz: Box<
+            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        lz.compress(&inp, true, |x| compressed_out.push(x));
+
+        let mut outp_f = BufWriter::new(File::create(outp_fn).unwrap());
+        for &lz_tok in &compressed_out {
+            match lz_tok {
+                LZOutput::Lit(lit) => {
+                    outp_f.write(&[0]).unwrap();
+                    outp_f.write(&[lit]).unwrap();
+                }
+                LZOutput::Ref { disp, len } => {
+                    outp_f.write(&[0xff]).unwrap();
+                    outp_f.write(&disp.to_le_bytes()).unwrap();
+                    outp_f.write(&len.to_le_bytes()).unwrap();
+                }
+            }
+        }
+
+        let mut decompress = Vec::new();
+        for &lz_tok in &compressed_out {
+            match lz_tok {
+                LZOutput::Lit(lit) => {
+                    decompress.push(lit);
+                }
+                LZOutput::Ref { disp, len } => {
+                    assert!(len > 0);
+                    assert!(disp >= 1);
+                    for _ in 0..len {
+                        decompress.push(decompress[decompress.len() - disp as usize]);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(inp, decompress);
+    }
+
+    #[test]
+    fn lz_big_file_2() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("src/lib.rs");
+        let outp_fn = d.join("test2.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut lz: Box<
+            LZEngine<32768, 256, { 32768 + 256 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        for i in 0..inp.len() {
+            lz.compress(&[inp[i]], false, |x| compressed_out.push(x));
+        }
+        lz.compress(&[], true, |x| compressed_out.push(x));
+
+        let mut outp_f = BufWriter::new(File::create(outp_fn).unwrap());
+        for &lz_tok in &compressed_out {
+            match lz_tok {
+                LZOutput::Lit(lit) => {
+                    outp_f.write(&[0]).unwrap();
+                    outp_f.write(&[lit]).unwrap();
+                }
+                LZOutput::Ref { disp, len } => {
+                    outp_f.write(&[0xff]).unwrap();
+                    outp_f.write(&disp.to_le_bytes()).unwrap();
+                    outp_f.write(&len.to_le_bytes()).unwrap();
+                }
+            }
+        }
+
+        let mut decompress = Vec::new();
+        for &lz_tok in &compressed_out {
+            match lz_tok {
+                LZOutput::Lit(lit) => {
+                    decompress.push(lit);
+                }
+                LZOutput::Ref { disp, len } => {
+                    assert!(len > 0);
+                    assert!(disp >= 1);
+                    for _ in 0..len {
+                        decompress.push(decompress[decompress.len() - disp as usize]);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(inp, decompress);
     }
 }
