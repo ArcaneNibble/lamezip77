@@ -299,7 +299,7 @@ enum LZOutput {
 
 #[repr(C)] // not sure if we need this because of padding bytes / uninitialized memory?
 struct HashBits<
-    const MIN_MATCH: u64,
+    const MIN_MATCH: usize,
     const HASH_BITS: usize,
     const HASH_SZ: usize,
     const DICT_BITS: usize,
@@ -312,7 +312,7 @@ struct HashBits<
 }
 
 impl<
-        const MIN_MATCH: u64,
+        const MIN_MATCH: usize,
         const HASH_BITS: usize,
         const HASH_SZ: usize,
         const DICT_BITS: usize,
@@ -342,7 +342,7 @@ impl<
         (*p).initial_lits_done = false;
     }
     fn calc_new_hash(&self, old_hash: u32, b: u8) -> u32 {
-        let hash_shift = ((HASH_BITS as u64) + MIN_MATCH - 1) / MIN_MATCH;
+        let hash_shift = (HASH_BITS + MIN_MATCH - 1) / MIN_MATCH;
         let hash = (old_hash << hash_shift) ^ (b as u32);
         hash & ((1 << HASH_BITS) - 1)
     }
@@ -372,8 +372,8 @@ struct LZEngine<
     const LOOKBACK_SZ: usize,
     const LOOKAHEAD_SZ: usize,
     const TOT_BUF_SZ: usize,
-    const MIN_MATCH: u64,
-    const MAX_MATCH: u64,
+    const MIN_MATCH: usize,
+    const MAX_MATCH: usize,
     const HASH_BITS: usize,
     const HASH_SZ: usize,
     const DICT_BITS: usize,
@@ -388,8 +388,8 @@ impl<
         const LOOKBACK_SZ: usize,
         const LOOKAHEAD_SZ: usize,
         const TOT_BUF_SZ: usize,
-        const MIN_MATCH: u64,
-        const MAX_MATCH: u64,
+        const MIN_MATCH: usize,
+        const MAX_MATCH: usize,
         const HASH_BITS: usize,
         const HASH_SZ: usize,
         const DICT_BITS: usize,
@@ -414,9 +414,8 @@ impl<
         assert_eq!(DICT_SZ, 1 << DICT_BITS);
         assert!(MIN_DISP >= 1);
         assert!(MIN_MATCH >= 1);
-        assert!(MIN_MATCH <= usize::MAX as u64);
         // this condition is required so that we can actually calculate hash
-        assert!(LOOKAHEAD_SZ as u64 >= MIN_MATCH);
+        assert!(LOOKAHEAD_SZ >= MIN_MATCH);
         assert!(HASH_BITS <= 32);
 
         Self {
@@ -429,9 +428,8 @@ impl<
         assert_eq!(DICT_SZ, 1 << DICT_BITS);
         assert!(MIN_DISP >= 1);
         assert!(MIN_MATCH >= 1);
-        assert!(MIN_MATCH <= usize::MAX as u64);
         // this condition is required so that we can actually calculate hash
-        assert!(LOOKAHEAD_SZ as u64 >= MIN_MATCH);
+        assert!(LOOKAHEAD_SZ >= MIN_MATCH);
         assert!(HASH_BITS <= 32);
 
         unsafe {
@@ -526,7 +524,7 @@ impl<
                 let lookback_spans = win.get_next_spans(eval_hpos, max_match);
                 let cursor_spans = win.get_next_spans(win.buf.rpos_real_offs, max_match);
 
-                let match_len = lookback_spans.compare(&cursor_spans) as u64;
+                let match_len = lookback_spans.compare(&cursor_spans);
                 debug_assert!(match_len <= MAX_MATCH);
                 if match_len >= MIN_MATCH {
                     if match_len > best_match_len {
@@ -542,7 +540,11 @@ impl<
                 win.roll_window(1);
             } else {
                 // output a match
-                todo!()
+                outp(LZOutput::Ref {
+                    disp: win.buf.rpos_real_offs - best_match_pos,
+                    len: best_match_len as u64,
+                });
+                win.roll_window(best_match_len);
             }
         }
 
@@ -1314,8 +1316,25 @@ mod tests {
         assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
         assert_eq!(compressed_out[1], LZOutput::Lit(0x34));
         assert_eq!(compressed_out[2], LZOutput::Lit(0x56));
-        assert_eq!(compressed_out[3], LZOutput::Lit(0x78));
-        assert_eq!(compressed_out[4], LZOutput::Lit(0x9a));
-        assert_eq!(compressed_out[5], LZOutput::Lit(0xbc));
+        assert_eq!(compressed_out[3], LZOutput::Ref { disp: 3, len: 3 });
+    }
+
+    #[test]
+    fn lz_longer_than_disp_repeat() {
+        let mut lz: Box<
+            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        lz.compress(
+            &[0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56],
+            true,
+            |x| compressed_out.push(x),
+        );
+
+        assert_eq!(compressed_out.len(), 4);
+        assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
+        assert_eq!(compressed_out[1], LZOutput::Lit(0x34));
+        assert_eq!(compressed_out[2], LZOutput::Lit(0x56));
+        assert_eq!(compressed_out[3], LZOutput::Ref { disp: 3, len: 6 });
     }
 }
