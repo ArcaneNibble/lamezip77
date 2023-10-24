@@ -10,8 +10,6 @@ pub struct HashBits<
     pub htab: [u64; HASH_SZ],
     pub prev: [u64; DICT_SZ],
     pub hash_of_head: u32,
-    pub redo_hash_at_cursor: bool,
-    pub redo_hash_behind_cursor_num_missing: u8,
 }
 
 impl<
@@ -27,8 +25,6 @@ impl<
             htab: [u64::MAX; HASH_SZ],
             prev: [u64::MAX; DICT_SZ],
             hash_of_head: 0,
-            redo_hash_at_cursor: true,
-            redo_hash_behind_cursor_num_missing: 0,
         }
     }
     pub unsafe fn initialize_at(p: *mut Self) {
@@ -43,8 +39,6 @@ impl<
             (*p_prev)[i] = u64::MAX;
         }
         (*p).hash_of_head = 0;
-        (*p).redo_hash_at_cursor = true;
-        (*p).redo_hash_behind_cursor_num_missing = 0;
     }
     pub fn calc_new_hash(&self, old_hash: u32, b: u8) -> u32 {
         let hash_shift = (HASH_BITS + MIN_MATCH - 1) / MIN_MATCH;

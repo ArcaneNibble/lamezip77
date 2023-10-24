@@ -6,9 +6,15 @@ use hashtables::HashBits;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LZSettings {
+    // if match >= this, use it immediately and stop searching
     pub good_enough_match_len: u64,
+    // if len > this, don't bother inserting all sliding substrings
+    // into hash table (only head)
     pub max_insert_all_match_len: u64,
+    // only follow the hash table at most this many times
     pub max_prev_chain_follows: u64,
+    // try one position forward to see if it gets better matches
+    pub try_lazy_additional_byte: bool,
 }
 
 impl Default for LZSettings {
@@ -17,6 +23,7 @@ impl Default for LZSettings {
             good_enough_match_len: u64::MAX,
             max_insert_all_match_len: u64::MAX,
             max_prev_chain_follows: u64::MAX,
+            try_lazy_additional_byte: false,
         }
     }
 }
@@ -41,6 +48,8 @@ pub struct LZEngine<
 > {
     sbuf: SlidingWindowBuf<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ>,
     h: HashBits<MIN_MATCH, HASH_BITS, HASH_SZ, DICT_BITS, DICT_SZ>,
+    redo_hash_at_cursor: bool,
+    redo_hash_behind_cursor_num_missing: u8,
 }
 
 impl<
@@ -81,6 +90,8 @@ impl<
         Self {
             sbuf: SlidingWindowBuf::new(),
             h: HashBits::new(),
+            redo_hash_at_cursor: true,
+            redo_hash_behind_cursor_num_missing: 0,
         }
     }
     pub fn new_boxed() -> Box<Self> {
@@ -98,6 +109,8 @@ impl<
             let p = std::alloc::alloc(layout) as *mut Self;
             SlidingWindowBuf::initialize_at(core::ptr::addr_of_mut!((*p).sbuf));
             HashBits::initialize_at(core::ptr::addr_of_mut!((*p).h));
+            (*p).redo_hash_at_cursor = true;
+            (*p).redo_hash_behind_cursor_num_missing = 0;
             Box::from_raw(p)
         }
     }
@@ -116,11 +129,11 @@ impl<
         // XXX is this the right condition?
         println!("tot ahead {}", win.tot_ahead_sz());
         while win.tot_ahead_sz() > if end_of_stream { 0 } else { LOOKAHEAD_SZ } {
-            if self.h.redo_hash_behind_cursor_num_missing > 0 {
+            if self.redo_hash_behind_cursor_num_missing > 0 {
                 println!(
                     "redo behind cursor @ {:08X} # {}",
                     win.cursor_pos(),
-                    self.h.redo_hash_behind_cursor_num_missing
+                    self.redo_hash_behind_cursor_num_missing
                 );
 
                 // we know there is >= 1 byte always, and >= LOOKAHEAD_SZ + 1 (aka >= MIN_MATCH + 1) bytes if not EOS
@@ -128,7 +141,7 @@ impl<
 
                 let mut hash = self.h.hash_of_head;
 
-                for i in (0..self.h.redo_hash_behind_cursor_num_missing).rev() {
+                for i in (0..self.redo_hash_behind_cursor_num_missing).rev() {
                     println!("redo behind pos -{} old hash {:04X}", i, hash);
                     // when we are in this situation, there is always one more htab update than hash update
                     // so we start with a hash update
@@ -147,11 +160,11 @@ impl<
                     }
                 }
 
-                self.h.redo_hash_behind_cursor_num_missing = 0;
+                self.redo_hash_behind_cursor_num_missing = 0;
                 self.h.hash_of_head = hash;
             }
 
-            if self.h.redo_hash_at_cursor {
+            if self.redo_hash_at_cursor {
                 println!("redo at cursor @ {:08X}", win.cursor_pos());
                 // we need to prime the hash table by recomputing the hash for cursor
                 // either at the start or after a span
@@ -164,7 +177,7 @@ impl<
                     hash = self.h.calc_new_hash(hash, win.peek_byte(i));
                 }
                 self.h.hash_of_head = hash;
-                self.h.redo_hash_at_cursor = false;
+                self.redo_hash_at_cursor = false;
             }
 
             let b: u8 = win.peek_byte(0);
@@ -239,11 +252,11 @@ impl<
                     let avail_extra_bytes = cursor_spans.len() - best_match_len;
                     println!("match -- {} extra bytes", avail_extra_bytes);
                     if avail_extra_bytes < MIN_MATCH {
-                        self.h.redo_hash_behind_cursor_num_missing =
+                        self.redo_hash_behind_cursor_num_missing =
                             (MIN_MATCH - avail_extra_bytes) as u8;
                     }
                 } else {
-                    self.h.redo_hash_at_cursor = true;
+                    self.redo_hash_at_cursor = true;
                 }
                 win.roll_window(best_match_len);
             }
