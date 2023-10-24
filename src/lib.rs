@@ -28,6 +28,8 @@ impl<const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: usiz
         }
     }
     unsafe fn initialize_at(p: *mut Self) {
+        assert!(TOT_BUF_SZ == LOOKBACK_SZ + LOOKAHEAD_SZ);
+
         let p_buf = core::ptr::addr_of_mut!((*p).buf);
         for i in 0..TOT_BUF_SZ {
             (*p_buf)[i] = 0;
@@ -41,16 +43,13 @@ impl<const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: usiz
         &'a mut self,
         inp: &'a [u8],
     ) -> SlidingWindow<'a, LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ> {
-        SlidingWindow {
-            buf: self,
-            inp: Some(inp),
-        }
+        SlidingWindow { buf: self, inp }
     }
 
     fn flush(&mut self) -> SlidingWindow<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ> {
         SlidingWindow {
             buf: self,
-            inp: None,
+            inp: &[],
         }
     }
 
@@ -78,7 +77,7 @@ struct SlidingWindow<
     const TOT_BUF_SZ: usize,
 > {
     buf: &'a mut SlidingWindowBuf<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ>,
-    inp: Option<&'a [u8]>,
+    inp: &'a [u8],
 }
 
 impl<'a, const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: usize>
@@ -106,7 +105,7 @@ impl<'a, const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: 
 
         if dist_to_look_back == 0 && lookahead_valid_sz == 0 {
             // all from input
-            SpanSet(&self.inp.unwrap()[..dist_to_look_forward], None, None)
+            SpanSet(&self.inp[..dist_to_look_forward], None, None)
         } else {
             let (sz_from_internal_buf, sz_from_external_buf) =
                 if dist_to_look_forward <= lookahead_valid_sz {
@@ -118,7 +117,7 @@ impl<'a, const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: 
                     )
                 };
             let external_slice = if sz_from_external_buf != 0 {
-                Some(&self.inp.unwrap()[..sz_from_external_buf])
+                Some(&self.inp[..sz_from_external_buf])
             } else {
                 None
             };
@@ -145,14 +144,14 @@ impl<'a, const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: 
     fn peek_byte(&self) -> u8 {
         let lookahead_valid_sz = self.buf.lookahead_valid_sz();
         if lookahead_valid_sz == 0 {
-            self.inp.unwrap()[0]
+            self.inp[0]
         } else {
             self.buf.buf[self.buf.rpos]
         }
     }
 
     fn tot_ahead_sz(&self) -> usize {
-        self.buf.lookahead_valid_sz() + self.inp.map_or(0, |x| x.len())
+        self.buf.lookahead_valid_sz() + self.inp.len()
     }
 
     fn roll_window(&mut self, bytes: usize) {
@@ -171,47 +170,44 @@ impl<'a, const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: 
         // (where rpos will be completely rewritten)
         self.buf.rpos = (self.buf.rpos + bytes) % TOT_BUF_SZ;
 
-        // it's okay if this is None -- the assert for tot_ahead_sz
-        // makes sure that we haven't exceeded available data
-        if let Some(inp) = self.inp.as_mut() {
-            let cur_wpos = self.buf.wpos;
-            // the amount we're rolling the window,
-            // plus however much is needed to make the lookahead fill up
-            let ideal_target_wsz = bytes + (LOOKAHEAD_SZ - lookahead_valid_sz);
-            let target_wsz = core::cmp::min(ideal_target_wsz, inp.len());
-            let target_wpos = (cur_wpos + target_wsz) % TOT_BUF_SZ;
-            self.buf.wpos = target_wpos;
+        let cur_wpos = self.buf.wpos;
+        // the amount we're rolling the window,
+        // plus however much is needed to make the lookahead fill up
+        let ideal_target_wsz = bytes + (LOOKAHEAD_SZ - lookahead_valid_sz);
+        let target_wsz = core::cmp::min(ideal_target_wsz, self.inp.len());
+        let target_wpos = (cur_wpos + target_wsz) % TOT_BUF_SZ;
+        self.buf.wpos = target_wpos;
 
-            // in the simple case, all we need to do is fill from
-            // cur_wpos to target_wpos with inp
-            // however, complexity arises if we manage to roll over
-            // more than the entirety of the buffer (including lookback)
-            if target_wsz < TOT_BUF_SZ {
-                if target_wpos >= cur_wpos {
-                    // no wraparound
-                    self.buf.buf[cur_wpos..target_wpos].copy_from_slice(&inp[..target_wsz]);
-                } else {
-                    // wraparound
-                    self.buf.buf[cur_wpos..].copy_from_slice(&inp[..TOT_BUF_SZ - cur_wpos]);
-                    self.buf.buf[..target_wpos]
-                        .copy_from_slice(&inp[TOT_BUF_SZ - cur_wpos..target_wsz]);
-                }
+        // in the simple case, all we need to do is fill from
+        // cur_wpos to target_wpos with inp
+        // however, complexity arises if we manage to roll over
+        // more than the entirety of the buffer (including lookback)
+        if target_wsz < TOT_BUF_SZ {
+            if target_wpos >= cur_wpos {
+                // no wraparound
+                self.buf.buf[cur_wpos..target_wpos].copy_from_slice(&self.inp[..target_wsz]);
             } else {
-                // we've rolled over more than a full buffer
-                // can reset everything so that it starts at the beginning
-                self.buf
-                    .buf
-                    .copy_from_slice(&inp[target_wsz - TOT_BUF_SZ..target_wsz]);
-                let shortened_lookahead = ideal_target_wsz - target_wsz;
-                debug_assert!(shortened_lookahead <= LOOKAHEAD_SZ);
-                self.buf.rpos = (LOOKBACK_SZ + shortened_lookahead) % TOT_BUF_SZ;
-                self.buf.wpos = 0;
+                // wraparound
+                self.buf.buf[cur_wpos..].copy_from_slice(&self.inp[..TOT_BUF_SZ - cur_wpos]);
+                self.buf.buf[..target_wpos]
+                    .copy_from_slice(&self.inp[TOT_BUF_SZ - cur_wpos..target_wsz]);
             }
-            *inp = &inp[target_wsz..];
+        } else {
+            // we've rolled over more than a full buffer
+            // can reset everything so that it starts at the beginning
+            self.buf
+                .buf
+                .copy_from_slice(&self.inp[target_wsz - TOT_BUF_SZ..target_wsz]);
+            let shortened_lookahead = ideal_target_wsz - target_wsz;
+            debug_assert!(shortened_lookahead <= LOOKAHEAD_SZ);
+            self.buf.rpos = (LOOKBACK_SZ + shortened_lookahead) % TOT_BUF_SZ;
+            self.buf.wpos = 0;
         }
+        self.inp = &self.inp[target_wsz..];
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 enum LZOutput {
     Lit(u8),
     Ref { disp: u64, len: u64 },
@@ -266,6 +262,7 @@ impl<
         let hash = (old_hash << hash_shift) ^ (b as u32);
         hash & ((1 << HASH_BITS) - 1)
     }
+    // returns old hashtable entry, which is a chain to follow when compressing
     fn put_head_into_htab<
         const LOOKBACK_SZ: usize,
         const LOOKAHEAD_SZ: usize,
@@ -273,13 +270,15 @@ impl<
     >(
         &mut self,
         win: &SlidingWindow<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ>,
-    ) {
+    ) -> u64 {
         let b = win.peek_byte();
         self.hash_of_head = self.calc_new_hash(self.hash_of_head, b);
         let old_hpos = self.htab[self.hash_of_head as usize];
         self.htab[self.hash_of_head as usize] = win.buf.rpos_real_offs;
         let prev_idx = win.buf.rpos_real_offs & ((1 << DICT_BITS) - 1);
         self.prev[prev_idx as usize] = old_hpos;
+
+        old_hpos
     }
 }
 
@@ -329,6 +328,7 @@ impl<
         assert_eq!(HASH_SZ, 1 << HASH_BITS);
         assert_eq!(DICT_SZ, 1 << DICT_BITS);
         assert!(MIN_DISP >= 1);
+        assert!(LOOKAHEAD_SZ > 0);
         assert!(HASH_BITS <= 32);
 
         Self {
@@ -362,6 +362,20 @@ impl<
             outp(LZOutput::Lit(b));
             self.h.put_head_into_htab(&win);
             self.h.initial_lits_done += 1;
+            win.roll_window(1);
+        }
+
+        // XXX is this the right condition?
+        while win.tot_ahead_sz() >= LOOKAHEAD_SZ {
+            let b = win.peek_byte();
+            let old_hpos = self.h.put_head_into_htab(&win);
+
+            if old_hpos == u64::MAX {
+                // no match
+                outp(LZOutput::Lit(b));
+            } else {
+                todo!()
+            }
         }
     }
 }
@@ -691,7 +705,7 @@ mod tests {
             buf.wpos = 123;
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5]);
             win.roll_window(0);
-            assert_eq!(win.inp, Some(&[][..]));
+            assert_eq!(win.inp, &[][..]);
             assert_eq!(buf.rpos, 123);
             assert_eq!(buf.wpos, 123 + 5);
             assert_eq!(buf.buf[123..123 + 5], [1, 2, 3, 4, 5]);
@@ -703,7 +717,7 @@ mod tests {
             buf.wpos = 123;
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5]);
             win.roll_window(1);
-            assert_eq!(win.inp, Some(&[][..]));
+            assert_eq!(win.inp, &[][..]);
             assert_eq!(buf.rpos, 124);
             assert_eq!(buf.wpos, 123 + 5);
             assert_eq!(buf.buf[123..123 + 5], [1, 2, 3, 4, 5]);
@@ -713,7 +727,7 @@ mod tests {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[123; 500]);
             win.roll_window(0);
-            assert_eq!(win.inp, Some(&[123; 500 - 256][..]));
+            assert_eq!(win.inp, &[123; 500 - 256][..]);
             assert_eq!(buf.rpos, 0);
             assert_eq!(buf.wpos, 256);
             assert_eq!(buf.buf[..256], [123; 256]);
@@ -723,7 +737,7 @@ mod tests {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[123; 500]);
             win.roll_window(111);
-            assert_eq!(win.inp, Some(&[123; 500 - 256 - 111][..]));
+            assert_eq!(win.inp, &[123; 500 - 256 - 111][..]);
             assert_eq!(buf.rpos, 111);
             assert_eq!(buf.wpos, 111 + 256);
             assert_eq!(buf.buf[..111 + 256], [123; 111 + 256]);
@@ -734,7 +748,7 @@ mod tests {
             let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             win.roll_window(0);
-            assert_eq!(win.inp, Some(&[5, 6, 7, 8, 9, 10, 11, 12][..]));
+            assert_eq!(win.inp, &[5, 6, 7, 8, 9, 10, 11, 12][..]);
             assert_eq!(buf.rpos, 0);
             assert_eq!(buf.wpos, 4);
             assert_eq!(buf.buf[..4], [1, 2, 3, 4]);
@@ -744,7 +758,7 @@ mod tests {
             let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             win.roll_window(7);
-            assert_eq!(win.inp, Some(&[12][..]));
+            assert_eq!(win.inp, &[12][..]);
             assert_eq!(buf.rpos, 7);
             assert_eq!(buf.wpos, 11);
             assert_eq!(buf.buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]);
@@ -754,7 +768,7 @@ mod tests {
             buf.wpos = 2;
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             win.roll_window(9);
-            assert_eq!(win.inp, Some(&[12][..]));
+            assert_eq!(win.inp, &[12][..]);
             assert_eq!(buf.rpos, 9);
             assert_eq!(buf.wpos, 1);
             assert_eq!(buf.buf, [11, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
@@ -769,7 +783,7 @@ mod tests {
             buf.wpos = 7;
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             win.roll_window(8);
-            assert_eq!(win.inp, Some(&[][..]));
+            assert_eq!(win.inp, &[][..]);
             assert_eq!(buf.rpos, 8);
             assert_eq!(buf.wpos, 0);
             assert_eq!(buf.buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
@@ -778,7 +792,7 @@ mod tests {
             let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
             win.roll_window(9);
-            assert_eq!(win.inp, Some(&[14, 15, 16][..]));
+            assert_eq!(win.inp, &[14, 15, 16][..]);
             assert_eq!(buf.rpos, 8);
             assert_eq!(buf.wpos, 0);
             assert_eq!(buf.buf, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
@@ -787,7 +801,7 @@ mod tests {
             let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             win.roll_window(9);
-            assert_eq!(win.inp, Some(&[][..]));
+            assert_eq!(win.inp, &[][..]);
             assert_eq!(buf.rpos, 9);
             assert_eq!(buf.wpos, 0);
             assert_eq!(buf.buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
@@ -796,7 +810,7 @@ mod tests {
             let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             win.roll_window(11);
-            assert_eq!(win.inp, Some(&[][..]));
+            assert_eq!(win.inp, &[][..]);
             assert_eq!(buf.rpos, 11);
             assert_eq!(buf.wpos, 0);
             assert_eq!(buf.buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
@@ -805,7 +819,7 @@ mod tests {
             let mut buf: SlidingWindowBuf<8, 4, { 8 + 4 }> = SlidingWindowBuf::new();
             let mut win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             win.roll_window(12);
-            assert_eq!(win.inp, Some(&[][..]));
+            assert_eq!(win.inp, &[][..]);
             assert_eq!(buf.rpos, 0);
             assert_eq!(buf.wpos, 0);
             assert_eq!(buf.buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
@@ -1000,5 +1014,35 @@ mod tests {
         assert_eq!(lz.h.prev[0], u64::MAX);
         assert_eq!(lz.h.prev[3], 2);
         assert_eq!(lz.h.prev[2], u64::MAX);
+    }
+
+    #[test]
+    fn lz_head() {
+        let mut lz: Box<
+            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        lz.compress(&[0x12, 0x34, 0x56], |x| compressed_out.push(x));
+
+        assert_eq!(compressed_out.len(), 3);
+        assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
+        assert_eq!(compressed_out[1], LZOutput::Lit(0x34));
+        assert_eq!(compressed_out[2], LZOutput::Lit(0x56));
+    }
+
+    #[test]
+    fn lz_not_compressible() {
+        let mut lz: Box<
+            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        lz.compress(&[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc], |x| {
+            compressed_out.push(x)
+        });
+
+        assert_eq!(compressed_out.len(), 3);
+        assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
+        assert_eq!(compressed_out[1], LZOutput::Lit(0x34));
+        assert_eq!(compressed_out[2], LZOutput::Lit(0x56));
     }
 }
