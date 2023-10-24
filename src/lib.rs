@@ -1605,7 +1605,9 @@ mod tests {
                 }
                 LZOutput::Ref { disp, len } => {
                     assert!(len > 0);
+                    assert!(len <= 256);
                     assert!(disp >= 1);
+                    assert!(disp <= 256);
                     for _ in 0..len {
                         decompress.push(decompress[decompress.len() - disp as usize]);
                     }
@@ -1657,7 +1659,9 @@ mod tests {
                 }
                 LZOutput::Ref { disp, len } => {
                     assert!(len > 0);
+                    assert!(len <= 256);
                     assert!(disp >= 1);
+                    assert!(disp <= 32768);
                     for _ in 0..len {
                         decompress.push(decompress[decompress.len() - disp as usize]);
                     }
