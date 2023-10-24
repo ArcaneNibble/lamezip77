@@ -330,6 +330,12 @@ impl<
         }
     }
     fn new_boxed() -> Box<Self> {
+        assert_eq!(HASH_SZ, 1 << HASH_BITS);
+        assert_eq!(DICT_SZ, 1 << DICT_BITS);
+        assert!(MIN_DISP >= 1);
+        assert!(LOOKAHEAD_SZ > 0);
+        assert!(HASH_BITS <= 32);
+
         unsafe {
             let layout = core::alloc::Layout::new::<Self>();
             let p = std::alloc::alloc(layout) as *mut Self;
@@ -339,7 +345,7 @@ impl<
         }
     }
 
-    fn compress<O>(&mut self, inp: &[u8], mut outp: O)
+    fn compress<O>(&mut self, inp: &[u8], end_of_stream: bool, mut outp: O)
     where
         O: FnMut(LZOutput),
     {
@@ -359,13 +365,14 @@ impl<
         }
 
         // XXX is this the right condition?
-        while win.tot_ahead_sz() >= LOOKAHEAD_SZ {
+        while win.tot_ahead_sz() >= if end_of_stream { 1 } else { LOOKAHEAD_SZ } {
             let b = win.peek_byte();
             let old_hpos = self.h.put_head_into_htab(&win);
 
             if old_hpos == u64::MAX {
                 // no match
                 outp(LZOutput::Lit(b));
+                win.roll_window(1);
             } else {
                 todo!()
             }
@@ -965,7 +972,7 @@ mod tests {
 
     #[test]
     fn hashing_inp() {
-        let mut lz: Box<LZEngine<1, 0, 1, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
+        let mut lz: Box<LZEngine<1, 1, 2, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
             LZEngine::new_boxed();
         let mut win = lz.sbuf.add_inp(&[0x12, 0x34, 0x56, 0x78]);
 
@@ -986,7 +993,7 @@ mod tests {
 
     #[test]
     fn hashing_inp_with_chaining() {
-        let mut lz: Box<LZEngine<1, 0, 1, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
+        let mut lz: Box<LZEngine<1, 1, 2, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
             LZEngine::new_boxed();
         let mut win = lz
             .sbuf
@@ -1010,12 +1017,27 @@ mod tests {
     }
 
     #[test]
-    fn lz_head() {
+    fn lz_head_only() {
         let mut lz: Box<
             LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
-        lz.compress(&[0x12, 0x34, 0x56], |x| compressed_out.push(x));
+        lz.compress(&[0x12, 0x34, 0x56], true, |x| compressed_out.push(x));
+
+        assert_eq!(compressed_out.len(), 3);
+        assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
+        assert_eq!(compressed_out[1], LZOutput::Lit(0x34));
+        assert_eq!(compressed_out[2], LZOutput::Lit(0x56));
+    }
+
+    #[test]
+    fn lz_head_split() {
+        let mut lz: Box<
+            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        lz.compress(&[0x12], false, |x| compressed_out.push(x));
+        lz.compress(&[0x34, 0x56], true, |x| compressed_out.push(x));
 
         assert_eq!(compressed_out.len(), 3);
         assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
@@ -1029,13 +1051,16 @@ mod tests {
             LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
-        lz.compress(&[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc], |x| {
+        lz.compress(&[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc], true, |x| {
             compressed_out.push(x)
         });
 
-        assert_eq!(compressed_out.len(), 3);
+        assert_eq!(compressed_out.len(), 6);
         assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
         assert_eq!(compressed_out[1], LZOutput::Lit(0x34));
         assert_eq!(compressed_out[2], LZOutput::Lit(0x56));
+        assert_eq!(compressed_out[3], LZOutput::Lit(0x78));
+        assert_eq!(compressed_out[4], LZOutput::Lit(0x9a));
+        assert_eq!(compressed_out[5], LZOutput::Lit(0xbc));
     }
 }
