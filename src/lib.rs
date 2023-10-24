@@ -18,6 +18,9 @@ impl<const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: usiz
     SlidingWindowBuf<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ>
 {
     fn new() -> Self {
+        // this is needed so that SlidingWindow can distinguish between
+        // completely empty and completely full
+        assert!(LOOKBACK_SZ > 0);
         assert!(TOT_BUF_SZ == LOOKBACK_SZ + LOOKAHEAD_SZ);
 
         Self {
@@ -28,6 +31,7 @@ impl<const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: usiz
         }
     }
     unsafe fn initialize_at(p: *mut Self) {
+        assert!(LOOKBACK_SZ > 0);
         assert!(TOT_BUF_SZ == LOOKBACK_SZ + LOOKAHEAD_SZ);
 
         let p_buf = core::ptr::addr_of_mut!((*p).buf);
@@ -411,8 +415,8 @@ impl<
         assert!(MIN_DISP >= 1);
         assert!(MIN_MATCH >= 1);
         assert!(MIN_MATCH <= usize::MAX as u64);
-        assert!(LOOKBACK_SZ as u64 >= MIN_MATCH);
-        assert!(LOOKAHEAD_SZ > 0);
+        // this condition is required so that we can actually calculate hash
+        assert!(LOOKAHEAD_SZ as u64 >= MIN_MATCH);
         assert!(HASH_BITS <= 32);
 
         Self {
@@ -426,8 +430,8 @@ impl<
         assert!(MIN_DISP >= 1);
         assert!(MIN_MATCH >= 1);
         assert!(MIN_MATCH <= usize::MAX as u64);
-        assert!(LOOKBACK_SZ as u64 >= MIN_MATCH);
-        assert!(LOOKAHEAD_SZ > 0);
+        // this condition is required so that we can actually calculate hash
+        assert!(LOOKAHEAD_SZ as u64 >= MIN_MATCH);
         assert!(HASH_BITS <= 32);
 
         unsafe {
@@ -445,7 +449,7 @@ impl<
     {
         let mut win = self.sbuf.add_inp(inp);
 
-        while self.h.initial_lits_done < MIN_MATCH {
+        /*while self.h.initial_lits_done < MIN_MATCH {
             // the first MIN_MATCH bytes can never be compressed as a backreference,
             // and we need to prime the hash table
             if win.tot_ahead_sz() == 0 {
@@ -465,10 +469,11 @@ impl<
                 hash = self.h.calc_new_hash(hash, initial_bytes[i]);
             }
             self.h.hash_of_head = hash;
-        }
+        }*/
 
         // XXX is this the right condition?
-        while win.tot_ahead_sz() >= if end_of_stream { 1 } else { LOOKAHEAD_SZ } {
+        println!("tot ahead {}", win.tot_ahead_sz());
+        while win.tot_ahead_sz() > if end_of_stream { 0 } else { LOOKAHEAD_SZ } {
             let b: u8 = win.peek_byte(0);
             let mut old_hpos = self.h.put_head_into_htab(&win);
 
@@ -518,6 +523,12 @@ impl<
                 // output a match
                 todo!()
             }
+        }
+
+        if win.tot_ahead_sz() > 0 {
+            debug_assert!(win.tot_ahead_sz() <= LOOKAHEAD_SZ);
+            win.roll_window(0);
+            debug_assert!(win.inp.len() == 0);
         }
     }
 }
@@ -1123,7 +1134,7 @@ mod tests {
 
     #[test]
     fn hashing_inp() {
-        let mut lz: Box<LZEngine<4, 1, 5, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
+        let mut lz: Box<LZEngine<1, 3, 4, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
             LZEngine::new_boxed();
         let mut win = lz.sbuf.add_inp(&[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc]);
 
@@ -1150,7 +1161,7 @@ mod tests {
 
     #[test]
     fn hashing_inp_with_chaining() {
-        let mut lz: Box<LZEngine<4, 1, 5, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
+        let mut lz: Box<LZEngine<1, 3, 4, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
             LZEngine::new_boxed();
         let mut win = lz.sbuf.add_inp(&[
             0,
@@ -1239,7 +1250,9 @@ mod tests {
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(&[0x12], false, |x| compressed_out.push(x));
+        println!("compress 1");
         lz.compress(&[0x34, 0x56], true, |x| compressed_out.push(x));
+        println!("compress 2");
 
         assert_eq!(compressed_out.len(), 3);
         assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
