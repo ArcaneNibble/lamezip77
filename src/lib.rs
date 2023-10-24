@@ -63,6 +63,88 @@ impl<const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: usiz
 // 5. part from stored, wraps around, part from inp (3 spans)
 struct SpanSet<'a>(&'a [u8], Option<&'a [u8]>, Option<&'a [u8]>);
 
+impl<'a> core::ops::Index<usize> for SpanSet<'a> {
+    type Output = u8;
+
+    fn index(&self, index: usize) -> &u8 {
+        if index < self.0.len() {
+            &self.0[index]
+        } else {
+            let index = index - self.0.len();
+            let _1 = self.1.unwrap();
+            if index < _1.len() {
+                &_1[index]
+            } else {
+                let index = index - _1.len();
+                let _2 = self.2.unwrap();
+                &_2[index]
+            }
+        }
+    }
+}
+
+impl<'a> SpanSet<'a> {
+    fn compare(&self, other: &Self) -> usize {
+        // todo optimizations? or can the compiler optimize this?
+        let mut len = 0;
+        let mut a = self.0;
+        let mut a_which = 0;
+        let mut b = other.0;
+        let mut b_which = 0;
+
+        loop {
+            if a.len() == 0 {
+                match a_which {
+                    0 => {
+                        if self.1.is_none() {
+                            break;
+                        }
+                        a = self.1.unwrap();
+                        a_which = 1;
+                    }
+                    1 => {
+                        if self.2.is_none() {
+                            break;
+                        }
+                        a = self.2.unwrap();
+                        a_which = 2;
+                    }
+                    _ => break,
+                }
+            }
+            if b.len() == 0 {
+                match b_which {
+                    0 => {
+                        if other.1.is_none() {
+                            break;
+                        }
+                        b = other.1.unwrap();
+                        b_which = 1;
+                    }
+                    1 => {
+                        if other.2.is_none() {
+                            break;
+                        }
+                        b = other.2.unwrap();
+                        b_which = 2;
+                    }
+                    _ => break,
+                }
+            }
+
+            if a[0] == b[0] {
+                len += 1;
+                a = &a[1..];
+                b = &b[1..];
+            } else {
+                break;
+            }
+        }
+
+        len
+    }
+}
+
 struct SlidingWindow<
     'a,
     const LOOKBACK_SZ: usize,
@@ -321,6 +403,9 @@ impl<
         assert_eq!(HASH_SZ, 1 << HASH_BITS);
         assert_eq!(DICT_SZ, 1 << DICT_BITS);
         assert!(MIN_DISP >= 1);
+        assert!(MIN_MATCH >= 1);
+        assert!(MIN_MATCH <= usize::MAX as u64);
+        assert!(LOOKBACK_SZ as u64 >= MIN_MATCH);
         assert!(LOOKAHEAD_SZ > 0);
         assert!(HASH_BITS <= 32);
 
@@ -333,6 +418,9 @@ impl<
         assert_eq!(HASH_SZ, 1 << HASH_BITS);
         assert_eq!(DICT_SZ, 1 << DICT_BITS);
         assert!(MIN_DISP >= 1);
+        assert!(MIN_MATCH >= 1);
+        assert!(MIN_MATCH <= usize::MAX as u64);
+        assert!(LOOKBACK_SZ as u64 >= MIN_MATCH);
         assert!(LOOKAHEAD_SZ > 0);
         assert!(HASH_BITS <= 32);
 
@@ -359,21 +447,69 @@ impl<
             }
             let b = win.peek_byte();
             outp(LZOutput::Lit(b));
-            self.h.put_head_into_htab(&win);
             self.h.initial_lits_done += 1;
             win.roll_window(1);
+        }
+
+        if self.h.initial_lits_done == MIN_MATCH {
+            // we can actually compute the initial hash now
+            let initial_bytes = win.get_next_spans(0, MIN_MATCH as usize);
+            let mut hash = 0;
+            for i in 0..(MIN_MATCH as usize) {
+                hash = self.h.calc_new_hash(hash, initial_bytes[i]);
+            }
+            self.h.hash_of_head = hash;
         }
 
         // XXX is this the right condition?
         while win.tot_ahead_sz() >= if end_of_stream { 1 } else { LOOKAHEAD_SZ } {
             let b = win.peek_byte();
-            let old_hpos = self.h.put_head_into_htab(&win);
+            let mut old_hpos = self.h.put_head_into_htab(&win);
 
-            if old_hpos == u64::MAX {
-                // no match
+            println!(
+                "working @ {:08X} with val {:02X} cur hash {:04X}",
+                win.buf.rpos_real_offs, b, self.h.hash_of_head
+            );
+            println!("hash pointer is {:08X}", old_hpos);
+
+            // initialize to an invalid value
+            let mut best_match_len = MIN_MATCH - 1;
+            let mut best_match_pos = u64::MAX;
+
+            // a match within range
+            // (we can terminate immediately because the prev chain only ever goes
+            // further and further backwards)
+            while old_hpos != u64::MAX && old_hpos + (LOOKBACK_SZ as u64) >= win.buf.rpos_real_offs
+            {
+                let eval_hpos = old_hpos;
+                old_hpos = self.h.prev[(old_hpos & ((1 << DICT_BITS) - 1)) as usize];
+
+                if !(eval_hpos + MIN_DISP <= win.buf.rpos_real_offs) {
+                    // too close
+                    continue;
+                }
+
+                // TODO many optimizations here
+                let max_match = MAX_MATCH.try_into().unwrap_or(usize::MAX);
+                let lookback_spans = win.get_next_spans(eval_hpos, max_match);
+                let cursor_spans = win.get_next_spans(win.buf.rpos_real_offs, max_match);
+
+                let match_len = lookback_spans.compare(&cursor_spans) as u64;
+                debug_assert!(match_len <= MAX_MATCH);
+                if match_len >= MIN_MATCH {
+                    if match_len > best_match_len {
+                        best_match_len = match_len;
+                        best_match_pos = eval_hpos;
+                    }
+                }
+            }
+
+            if best_match_len < MIN_MATCH {
+                // output a literal
                 outp(LZOutput::Lit(b));
                 win.roll_window(1);
             } else {
+                // output a match
                 todo!()
             }
         }
@@ -972,7 +1108,7 @@ mod tests {
 
     #[test]
     fn hashing_inp() {
-        let mut lz: Box<LZEngine<1, 1, 2, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
+        let mut lz: Box<LZEngine<4, 1, 5, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
             LZEngine::new_boxed();
         let mut win = lz.sbuf.add_inp(&[0x12, 0x34, 0x56, 0x78]);
 
@@ -993,7 +1129,7 @@ mod tests {
 
     #[test]
     fn hashing_inp_with_chaining() {
-        let mut lz: Box<LZEngine<1, 1, 2, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
+        let mut lz: Box<LZEngine<4, 1, 5, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
             LZEngine::new_boxed();
         let mut win = lz
             .sbuf
@@ -1014,6 +1150,42 @@ mod tests {
         assert_eq!(lz.h.prev[0], u64::MAX);
         assert_eq!(lz.h.prev[3], 2);
         assert_eq!(lz.h.prev[2], u64::MAX);
+    }
+
+    #[test]
+    fn span_set_compare() {
+        let a = SpanSet(&[1, 2, 3, 4, 5, 6, 7, 8], None, None);
+
+        let b = SpanSet(&[1, 2, 3, 4, 5, 6, 7], None, None);
+        assert_eq!(a.compare(&b), 7);
+
+        let b = SpanSet(&[1, 2, 3, 4, 5, 6, 7, 8, 9], None, None);
+        assert_eq!(a.compare(&b), 8);
+
+        let b = SpanSet(&[1, 2, 3, 4, 4, 6, 7], None, None);
+        assert_eq!(a.compare(&b), 4);
+
+        let b = SpanSet(&[1, 2, 3], Some(&[4, 5, 6, 7]), None);
+        assert_eq!(a.compare(&b), 7);
+
+        let b = SpanSet(&[1, 2, 3], Some(&[4, 5, 5, 7]), None);
+        assert_eq!(a.compare(&b), 5);
+
+        let b = SpanSet(&[1, 2, 3], Some(&[4]), Some(&[5, 6]));
+        assert_eq!(a.compare(&b), 6);
+
+        let a = SpanSet(&[1, 2], Some(&[3, 4, 5, 6]), Some(&[7, 8]));
+        let b = SpanSet(&[1, 2, 3], Some(&[4, 5]), Some(&[6, 7, 8, 9]));
+        assert_eq!(a.compare(&b), 8);
+    }
+
+    #[test]
+    fn span_index() {
+        let a = SpanSet(&[1, 2], Some(&[3, 4, 5, 6]), Some(&[7, 8]));
+
+        for i in 0..8 {
+            assert_eq!(a[i], (i + 1) as u8);
+        }
     }
 
     #[test]
@@ -1056,6 +1228,25 @@ mod tests {
         });
 
         assert_eq!(compressed_out.len(), 6);
+        assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
+        assert_eq!(compressed_out[1], LZOutput::Lit(0x34));
+        assert_eq!(compressed_out[2], LZOutput::Lit(0x56));
+        assert_eq!(compressed_out[3], LZOutput::Lit(0x78));
+        assert_eq!(compressed_out[4], LZOutput::Lit(0x9a));
+        assert_eq!(compressed_out[5], LZOutput::Lit(0xbc));
+    }
+
+    #[test]
+    fn lz_simple_repeat() {
+        let mut lz: Box<
+            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        lz.compress(&[0x12, 0x34, 0x56, 0x12, 0x34, 0x56], true, |x| {
+            compressed_out.push(x)
+        });
+
+        assert_eq!(compressed_out.len(), 4);
         assert_eq!(compressed_out[0], LZOutput::Lit(0x12));
         assert_eq!(compressed_out[1], LZOutput::Lit(0x34));
         assert_eq!(compressed_out[2], LZOutput::Lit(0x56));
