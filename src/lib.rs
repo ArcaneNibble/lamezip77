@@ -17,6 +17,8 @@ pub struct LZSettings {
     pub defer_output_match: bool,
     // don't look for a potentially-longer match if there is already one this good
     pub good_enough_defer_len: u64,
+    // if there is already a match this good, follow the chain fewer times
+    pub search_faster_defer_len: u64,
 }
 
 impl Default for LZSettings {
@@ -27,6 +29,7 @@ impl Default for LZSettings {
             max_prev_chain_follows: u64::MAX,
             defer_output_match: false,
             good_enough_defer_len: u64::MAX,
+            search_faster_defer_len: u64::MAX,
         }
     }
 }
@@ -212,8 +215,6 @@ impl<
             let mut old_hpos = self.h.put_head_into_htab(&win);
             println!("hash pointer is {:08X}", old_hpos);
 
-            let mut prev_follow_limit = settings.max_prev_chain_follows;
-
             // initialize to an invalid value
             let mut best_match_len = MIN_MATCH - 1;
             let mut best_match_pos = u64::MAX;
@@ -225,10 +226,23 @@ impl<
             let cursor_spans = win.get_next_spans(win.cursor_pos(), max_match + MIN_MATCH + 1);
 
             let skip_search = if let Some(deferred_match) = self.deferred_match {
+                // should always be true because of the XXX check at the beginning
+                debug_assert!(settings.defer_output_match);
                 deferred_match.best_match_len >= settings.good_enough_defer_len
             } else {
                 false
             };
+
+            let mut prev_follow_limit = if let Some(deferred_match) = self.deferred_match {
+                if deferred_match.best_match_len >= settings.search_faster_defer_len {
+                    settings.max_prev_chain_follows / 4
+                } else {
+                    settings.max_prev_chain_follows
+                }
+            } else {
+                settings.max_prev_chain_follows
+            };
+
             if !skip_search {
                 // a match within range
                 // (we can terminate immediately because the prev chain only ever goes
