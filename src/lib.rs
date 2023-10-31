@@ -215,12 +215,12 @@ impl<
             let mut old_hpos = self.h.put_head_into_htab(&win);
             println!("hash pointer is {:08X}", old_hpos);
 
-            // initialize to an invalid value
-            let mut best_match_len = MIN_MATCH - 1;
+            let mut best_match_endpeek = b;
+            let mut best_match_len = 1;
             let mut best_match_pos = u64::MAX;
 
             // this is what we're matching against
-            let max_match = MAX_MATCH.try_into().unwrap_or(usize::MAX);
+            let max_match = MAX_MATCH.try_into().unwrap_or(usize::MAX - MIN_MATCH - 1);
             // extra few bytes in the hopes that we don't have to
             // do the redo_hash_behind_cursor_num_missing calculation
             let cursor_spans = win.get_next_spans(win.cursor_pos(), max_match + MIN_MATCH + 1);
@@ -263,7 +263,13 @@ impl<
 
                     let lookback_spans = win.get_next_spans(eval_hpos, max_match);
 
-                    // TODO many optimizations here
+                    // optimization because the match can't get better if it
+                    // doesn't match the best one we've got up to the best length we've got
+                    if lookback_spans[best_match_len - 1] != best_match_endpeek {
+                        println!("peek skip");
+                        continue;
+                    }
+
                     let match_len = lookback_spans.compare(&cursor_spans);
                     println!("match len {} span len {}", match_len, lookback_spans.len());
                     debug_assert!(match_len <= MAX_MATCH);
@@ -271,6 +277,7 @@ impl<
                         if match_len > best_match_len {
                             best_match_len = match_len;
                             best_match_pos = eval_hpos;
+                            best_match_endpeek = lookback_spans[match_len - 1];
                             if match_len as u64 >= settings.good_enough_search_len {
                                 break;
                             }
@@ -395,6 +402,7 @@ impl<
 
         if win.tot_ahead_sz() > 0 {
             debug_assert!(win.tot_ahead_sz() <= LOOKAHEAD_SZ);
+            // ensure everything left is pulled into the buffer before we let go of inp
             win.roll_window(0);
         }
 
