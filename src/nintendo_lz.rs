@@ -1,5 +1,7 @@
 use std::error::Error;
 
+use crate::{LZEngine, LZOutput, LZSettings};
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DecompressState {
     HdrMagic,
@@ -102,6 +104,12 @@ impl DecompressStreaming {
             (*p).match_b0 = 0;
             Box::from_raw(p)
         }
+    }
+
+    pub fn manually_set_len(&mut self, len: u32) {
+        assert!(self.state == DecompressState::HdrMagic);
+        self.state = DecompressState::BlockFlags;
+        self.remaining_bytes = len;
     }
 
     const fn need_more_bytes(&self) -> bool {
@@ -291,8 +299,108 @@ impl DecompressBuffered {
     }
 }
 
+pub struct Compress {
+    engine:
+        LZEngine<LOOKBACK_SZ, 18, { LOOKBACK_SZ + 18 }, 3, 18, 12, { 1 << 12 }, 12, { 1 << 12 }>,
+    buffered_out: [LZOutput; 8],
+    num_buffered_out: u8,
+}
+
+impl Compress {
+    pub fn new() -> Self {
+        Self {
+            engine: LZEngine::new(),
+            buffered_out: [LZOutput::default(); 8],
+            num_buffered_out: 0,
+        }
+    }
+    pub fn new_boxed() -> Box<Self> {
+        unsafe {
+            let layout = core::alloc::Layout::new::<Self>();
+            let p = std::alloc::alloc(layout) as *mut Self;
+            LZEngine::initialize_at(core::ptr::addr_of_mut!((*p).engine));
+            let p_buffered_out = core::ptr::addr_of_mut!((*p).buffered_out);
+            for i in 0..8 {
+                // my understanding is that this is safe because u64 doesn't have Drop
+                // and we don't construct a & anywhere
+                (*p_buffered_out)[i] = LZOutput::default();
+            }
+            (*p).num_buffered_out = 0;
+            Box::from_raw(p)
+        }
+    }
+
+    pub fn compress<O>(&mut self, vram_mode: bool, inp: &[u8], end_of_stream: bool, mut outp: O)
+    where
+        O: FnMut(u8),
+    {
+        let settings = LZSettings {
+            good_enough_search_len: 18,
+            max_len_to_insert_all_substr: u64::MAX,
+            max_prev_chain_follows: 1 << 12,
+            defer_output_match: true,
+            good_enough_defer_len: 18,
+            search_faster_defer_len: 10,
+            min_disp: if vram_mode { 2 } else { 1 },
+        };
+
+        macro_rules! dump_buffered_out {
+            () => {
+                let mut flags = 0;
+                for i in 0..self.num_buffered_out {
+                    match self.buffered_out[i as usize] {
+                        LZOutput::Lit(_) => {}
+                        LZOutput::Ref { .. } => {
+                            flags |= 1 << (7 - i);
+                        }
+                    }
+                }
+                outp(flags);
+
+                for i in 0..self.num_buffered_out {
+                    match self.buffered_out[i as usize] {
+                        LZOutput::Lit(lit) => {
+                            outp(lit);
+                        }
+                        LZOutput::Ref { disp, len } => {
+                            debug_assert!(disp >= 1);
+                            debug_assert!(disp <= 0x1000);
+                            debug_assert!(len >= 3);
+                            debug_assert!(len <= 18);
+
+                            let disp = disp - 1;
+                            let len = len - 3;
+
+                            outp(((disp >> 8) as u8) | ((len << 4) as u8));
+                            outp(disp as u8);
+                        }
+                    }
+                }
+            };
+        }
+
+        self.engine.compress(&settings, inp, end_of_stream, |x| {
+            self.buffered_out[self.num_buffered_out as usize] = x;
+            self.num_buffered_out += 1;
+            if self.num_buffered_out == 8 {
+                dump_buffered_out!();
+                self.num_buffered_out = 0;
+            }
+        });
+
+        if end_of_stream && self.num_buffered_out > 0 {
+            dump_buffered_out!();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::File,
+        io::{BufWriter, Write},
+    };
+
     use super::*;
 
     #[test]
@@ -448,5 +556,45 @@ mod tests {
 
         let ret = dec.decompress_new(&[0x10, 9, 0, 0, 0b00001000, 1, 2, 3, 4, 0b0000_0000]);
         assert_eq!(ret, Err(DecompressError::TooShort));
+    }
+
+    #[test]
+    fn nin_basic_compress() {
+        let mut comp = Compress::new_boxed();
+        let mut out = Vec::new();
+        comp.compress(false, &[1, 2, 3, 4, 2, 3, 4, 2, 3, 4, 5, 6], true, |x| {
+            out.push(x)
+        });
+
+        assert_eq!(out, &[0b00001000, 1, 2, 3, 4, 0b0011_0000, 2, 5, 6]);
+    }
+
+    #[test]
+    fn nin_roundtrip_bytewise() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("src/nintendo_lz.rs");
+        let outp_fn = d.join("nintendo_lz_test.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut comp = Compress::new_boxed();
+        let mut compressed_out = Vec::new();
+        compressed_out.push(0x10);
+        compressed_out.push(inp.len() as u8);
+        compressed_out.push((inp.len() >> 8) as u8);
+        compressed_out.push((inp.len() >> 16) as u8);
+        for i in 0..inp.len() {
+            comp.compress(false, &[inp[i]], false, |x| compressed_out.push(x));
+        }
+        comp.compress(false, &[], true, |x| compressed_out.push(x));
+
+        let mut outp_f = BufWriter::new(File::create(outp_fn).unwrap());
+        outp_f.write(&compressed_out).unwrap();
+
+        let dec = DecompressBuffered::new();
+        let decompress = dec.decompress_new(&compressed_out).unwrap();
+
+        assert_eq!(inp, decompress);
     }
 }

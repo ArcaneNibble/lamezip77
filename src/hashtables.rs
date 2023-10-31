@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn hashing_inp() {
-        let mut lz: Box<LZEngine<1, 3, 4, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
+        let mut lz: Box<LZEngine<1, 3, 4, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
             LZEngine::new_boxed();
         let mut win = lz.sbuf.add_inp(&[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc]);
 
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn hashing_inp_with_chaining() {
-        let mut lz: Box<LZEngine<1, 3, 4, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>> =
+        let mut lz: Box<LZEngine<1, 3, 4, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
             LZEngine::new_boxed();
         let mut win = lz.sbuf.add_inp(&[
             0,

@@ -16,6 +16,8 @@ pub struct LZSettings {
     pub good_enough_defer_len: u64,
     // if there is already a match this good, follow the chain fewer times
     pub search_faster_defer_len: u64,
+    // this is used for nintendo lz s.t. a disp of -1 won't be used
+    pub min_disp: u64,
 }
 
 impl Default for LZSettings {
@@ -27,6 +29,7 @@ impl Default for LZSettings {
             defer_output_match: false,
             good_enough_defer_len: u64::MAX,
             search_faster_defer_len: u64::MAX,
+            min_disp: 1,
         }
     }
 }
@@ -35,6 +38,12 @@ impl Default for LZSettings {
 pub enum LZOutput {
     Lit(u8),
     Ref { disp: u64, len: u64 },
+}
+
+impl Default for LZOutput {
+    fn default() -> Self {
+        Self::Lit(0)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -54,7 +63,6 @@ pub struct LZEngine<
     const HASH_SZ: usize,
     const DICT_BITS: usize,
     const DICT_SZ: usize,
-    const MIN_DISP: u64,
 > {
     pub(crate) sbuf: SlidingWindowBuf<LOOKBACK_SZ, LOOKAHEAD_SZ, TOT_BUF_SZ>,
     pub(crate) h: HashBits<MIN_MATCH, HASH_BITS, HASH_SZ, DICT_BITS, DICT_SZ>,
@@ -73,7 +81,6 @@ impl<
         const HASH_SZ: usize,
         const DICT_BITS: usize,
         const DICT_SZ: usize,
-        const MIN_DISP: u64,
     >
     LZEngine<
         LOOKBACK_SZ,
@@ -85,13 +92,11 @@ impl<
         HASH_SZ,
         DICT_BITS,
         DICT_SZ,
-        MIN_DISP,
     >
 {
     pub fn new() -> Self {
         assert_eq!(HASH_SZ, 1 << HASH_BITS);
         assert_eq!(DICT_SZ, 1 << DICT_BITS);
-        assert!(MIN_DISP >= 1);
         assert!(MIN_MATCH >= 1);
         assert!(MIN_MATCH <= u8::MAX as usize);
         // this condition is required so that we can actually calculate hash
@@ -107,25 +112,27 @@ impl<
         }
     }
     pub fn new_boxed() -> Box<Self> {
+        unsafe {
+            let layout = core::alloc::Layout::new::<Self>();
+            let p = std::alloc::alloc(layout) as *mut Self;
+            Self::initialize_at(p);
+            Box::from_raw(p)
+        }
+    }
+    pub(crate) unsafe fn initialize_at(p: *mut Self) {
         assert_eq!(HASH_SZ, 1 << HASH_BITS);
         assert_eq!(DICT_SZ, 1 << DICT_BITS);
-        assert!(MIN_DISP >= 1);
         assert!(MIN_MATCH >= 1);
         assert!(MIN_MATCH <= u8::MAX as usize);
         // this condition is required so that we can actually calculate hash
         assert!(LOOKAHEAD_SZ >= MIN_MATCH);
         assert!(HASH_BITS <= 32);
 
-        unsafe {
-            let layout = core::alloc::Layout::new::<Self>();
-            let p = std::alloc::alloc(layout) as *mut Self;
-            SlidingWindowBuf::initialize_at(core::ptr::addr_of_mut!((*p).sbuf));
-            HashBits::initialize_at(core::ptr::addr_of_mut!((*p).h));
-            (*p).redo_hash_at_cursor = true;
-            (*p).redo_hash_behind_cursor_num_missing = 0;
-            (*p).deferred_match = None;
-            Box::from_raw(p)
-        }
+        SlidingWindowBuf::initialize_at(core::ptr::addr_of_mut!((*p).sbuf));
+        HashBits::initialize_at(core::ptr::addr_of_mut!((*p).h));
+        (*p).redo_hash_at_cursor = true;
+        (*p).redo_hash_behind_cursor_num_missing = 0;
+        (*p).deferred_match = None;
     }
 
     pub fn compress<O>(
@@ -137,6 +144,8 @@ impl<
     ) where
         O: FnMut(LZOutput),
     {
+        assert!(settings.min_disp >= 1);
+
         let mut win = self.sbuf.add_inp(inp);
 
         if !settings.defer_output_match {
@@ -229,7 +238,7 @@ impl<
                     let eval_hpos = old_hpos;
                     old_hpos = self.h.prev[(old_hpos & ((1 << DICT_BITS) - 1)) as usize];
 
-                    if !(eval_hpos + MIN_DISP <= win.cursor_pos()) {
+                    if !(eval_hpos + settings.min_disp <= win.cursor_pos()) {
                         // too close
                         continue;
                     }
@@ -379,9 +388,8 @@ mod tests {
 
     #[test]
     fn lz_head_only() {
-        let mut lz: Box<
-            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
-        > = LZEngine::new_boxed();
+        let mut lz: Box<LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
+            LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(&LZSettings::default(), &[0x12, 0x34, 0x56], true, |x| {
             compressed_out.push(x)
@@ -395,9 +403,8 @@ mod tests {
 
     #[test]
     fn lz_head_split() {
-        let mut lz: Box<
-            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
-        > = LZEngine::new_boxed();
+        let mut lz: Box<LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
+            LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(&LZSettings::default(), &[0x12], false, |x| {
             compressed_out.push(x)
@@ -416,9 +423,8 @@ mod tests {
 
     #[test]
     fn lz_not_compressible() {
-        let mut lz: Box<
-            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
-        > = LZEngine::new_boxed();
+        let mut lz: Box<LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
+            LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
             &LZSettings::default(),
@@ -438,9 +444,8 @@ mod tests {
 
     #[test]
     fn lz_simple_repeat() {
-        let mut lz: Box<
-            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
-        > = LZEngine::new_boxed();
+        let mut lz: Box<LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
+            LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
             &LZSettings::default(),
@@ -458,9 +463,8 @@ mod tests {
 
     #[test]
     fn lz_longer_than_disp_repeat() {
-        let mut lz: Box<
-            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
-        > = LZEngine::new_boxed();
+        let mut lz: Box<LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
+            LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
             &LZSettings::default(),
@@ -478,9 +482,8 @@ mod tests {
 
     #[test]
     fn lz_longer_than_lookahead_repeat() {
-        let mut lz: Box<
-            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
-        > = LZEngine::new_boxed();
+        let mut lz: Box<LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
+            LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
             &LZSettings::default(),
@@ -501,9 +504,8 @@ mod tests {
 
     #[test]
     fn lz_split_repeat() {
-        let mut lz: Box<
-            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
-        > = LZEngine::new_boxed();
+        let mut lz: Box<LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
+            LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
             &LZSettings::default(),
@@ -530,9 +532,8 @@ mod tests {
 
     #[test]
     fn lz_detailed_backref_hashing() {
-        let mut lz: Box<
-            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
-        > = LZEngine::new_boxed();
+        let mut lz: Box<LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
+            LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
             &LZSettings::default(),
@@ -581,9 +582,8 @@ mod tests {
 
     #[test]
     fn lz_peek_ahead_after_span() {
-        let mut lz: Box<
-            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
-        > = LZEngine::new_boxed();
+        let mut lz: Box<LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
+            LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
             &LZSettings::default(),
@@ -655,9 +655,8 @@ mod tests {
 
         let inp = std::fs::read(inp_fn).unwrap();
 
-        let mut lz: Box<
-            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
-        > = LZEngine::new_boxed();
+        let mut lz: Box<LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
+            LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(&LZSettings::default(), &inp, true, |x| {
             compressed_out.push(x)
@@ -709,7 +708,7 @@ mod tests {
         let inp = std::fs::read(inp_fn).unwrap();
 
         let mut lz: Box<
-            LZEngine<32768, 256, { 32768 + 256 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+            LZEngine<32768, 256, { 32768 + 256 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>,
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         for i in 0..inp.len() {
@@ -762,9 +761,8 @@ mod tests {
         let mut settings = LZSettings::default();
         settings.max_len_to_insert_all_substr = 4;
 
-        let mut lz: Box<
-            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
-        > = LZEngine::new_boxed();
+        let mut lz: Box<LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
+            LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
             &settings,
@@ -789,9 +787,8 @@ mod tests {
         let mut settings = LZSettings::default();
         settings.defer_output_match = true;
 
-        let mut lz: Box<
-            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
-        > = LZEngine::new_boxed();
+        let mut lz: Box<LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
+            LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
             &settings,
@@ -818,9 +815,8 @@ mod tests {
         settings.defer_output_match = true;
         settings.good_enough_defer_len = 3;
 
-        let mut lz: Box<
-            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
-        > = LZEngine::new_boxed();
+        let mut lz: Box<LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
+            LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         lz.compress(
             &settings,
@@ -855,7 +851,7 @@ mod tests {
         let mut settings = LZSettings::default();
         settings.defer_output_match = true;
         let mut lz: Box<
-            LZEngine<32768, 256, { 32768 + 256 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+            LZEngine<32768, 256, { 32768 + 256 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>,
         > = LZEngine::new_boxed();
         let mut compressed_out = Vec::new();
         for i in 0..inp.len() {
