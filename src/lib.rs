@@ -7,23 +7,26 @@ use hashtables::HashBits;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LZSettings {
     // if match >= this, use it immediately and stop searching
-    pub good_enough_match_len: u64,
+    pub good_enough_search_len: u64,
     // if len > this, don't bother inserting all sliding substrings
     // into hash table (only head)
-    pub max_insert_all_match_len: u64,
+    pub max_len_to_insert_all_substr: u64,
     // only follow the hash table at most this many times
     pub max_prev_chain_follows: u64,
     // try one position forward to see if it gets better matches
     pub defer_output_match: bool,
+    // don't look for a potentially-longer match if there is already one this good
+    pub good_enough_defer_len: u64,
 }
 
 impl Default for LZSettings {
     fn default() -> Self {
         Self {
-            good_enough_match_len: u64::MAX,
-            max_insert_all_match_len: u64::MAX,
+            good_enough_search_len: u64::MAX,
+            max_len_to_insert_all_substr: u64::MAX,
             max_prev_chain_follows: u64::MAX,
             defer_output_match: false,
+            good_enough_defer_len: u64::MAX,
         }
     }
 }
@@ -136,7 +139,15 @@ impl<
     {
         let mut win = self.sbuf.add_inp(inp);
 
-        // XXX is this the right condition?
+        if !settings.defer_output_match {
+            if let Some(deferred_match) = self.deferred_match {
+                // XXX this is not tested
+                println!("dump out deferred match");
+                outp(LZOutput::Lit(deferred_match.first_byte));
+                self.deferred_match = None;
+            }
+        }
+
         println!("tot ahead {}", win.tot_ahead_sz());
         while win.tot_ahead_sz() > if end_of_stream { 0 } else { LOOKAHEAD_SZ } {
             if self.redo_hash_behind_cursor_num_missing > 0 {
@@ -209,38 +220,46 @@ impl<
 
             // this is what we're matching against
             let max_match = MAX_MATCH.try_into().unwrap_or(usize::MAX);
-            // extra in the hopes that we don't have to recompute hash later
+            // extra few bytes in the hopes that we don't have to
+            // do the redo_hash_behind_cursor_num_missing calculation
             let cursor_spans = win.get_next_spans(win.cursor_pos(), max_match + MIN_MATCH + 1);
 
-            // a match within range
-            // (we can terminate immediately because the prev chain only ever goes
-            // further and further backwards)
-            while prev_follow_limit > 0
-                && old_hpos != u64::MAX
-                && old_hpos + (LOOKBACK_SZ as u64) >= win.cursor_pos()
-            {
-                prev_follow_limit -= 1;
-                let eval_hpos = old_hpos;
-                println!("probing at {:08X}", eval_hpos);
-                old_hpos = self.h.prev[(old_hpos & ((1 << DICT_BITS) - 1)) as usize];
+            let skip_search = if let Some(deferred_match) = self.deferred_match {
+                deferred_match.best_match_len >= settings.good_enough_defer_len
+            } else {
+                false
+            };
+            if !skip_search {
+                // a match within range
+                // (we can terminate immediately because the prev chain only ever goes
+                // further and further backwards)
+                while prev_follow_limit > 0
+                    && old_hpos != u64::MAX
+                    && old_hpos + (LOOKBACK_SZ as u64) >= win.cursor_pos()
+                {
+                    prev_follow_limit -= 1;
+                    let eval_hpos = old_hpos;
+                    println!("probing at {:08X}", eval_hpos);
+                    old_hpos = self.h.prev[(old_hpos & ((1 << DICT_BITS) - 1)) as usize];
 
-                if !(eval_hpos + MIN_DISP <= win.cursor_pos()) {
-                    // too close
-                    continue;
-                }
+                    if !(eval_hpos + MIN_DISP <= win.cursor_pos()) {
+                        // too close
+                        continue;
+                    }
 
-                let lookback_spans = win.get_next_spans(eval_hpos, max_match);
+                    let lookback_spans = win.get_next_spans(eval_hpos, max_match);
 
-                // TODO many optimizations here
-                let match_len = lookback_spans.compare(&cursor_spans);
-                println!("match len {} span len {}", match_len, lookback_spans.len());
-                debug_assert!(match_len <= MAX_MATCH);
-                if match_len >= MIN_MATCH {
-                    if match_len > best_match_len {
-                        best_match_len = match_len;
-                        best_match_pos = eval_hpos;
-                        if match_len as u64 >= settings.good_enough_match_len {
-                            break;
+                    // TODO many optimizations here
+                    let match_len = lookback_spans.compare(&cursor_spans);
+                    println!("match len {} span len {}", match_len, lookback_spans.len());
+                    debug_assert!(match_len <= MAX_MATCH);
+                    if match_len >= MIN_MATCH {
+                        if match_len > best_match_len {
+                            best_match_len = match_len;
+                            best_match_pos = eval_hpos;
+                            if match_len as u64 >= settings.good_enough_search_len {
+                                break;
+                            }
                         }
                     }
                 }
@@ -266,7 +285,7 @@ impl<
                         });
 
                         let match_len_minus_1 = (deferred_match.best_match_len - 1) as usize;
-                        if deferred_match.best_match_len <= settings.max_insert_all_match_len {
+                        if deferred_match.best_match_len <= settings.max_len_to_insert_all_substr {
                             // because of the advancing of one position, the hash starting at cursor_pos() is already inserted
                             // put_span_into_htab starts at +1, so this actually starts at cursor_pos()+1
                             let deferred_span =
@@ -343,7 +362,7 @@ impl<
                         disp: win.cursor_pos() - best_match_pos,
                         len: best_match_len as u64,
                     });
-                    if best_match_len as u64 <= settings.max_insert_all_match_len {
+                    if best_match_len as u64 <= settings.max_len_to_insert_all_substr {
                         self.h
                             .put_span_into_htab(&cursor_spans, win.cursor_pos(), best_match_len);
                         let avail_extra_bytes = cursor_spans.len() - best_match_len;
@@ -779,7 +798,7 @@ mod tests {
     #[test]
     fn lz_max_insert_len() {
         let mut settings = LZSettings::default();
-        settings.max_insert_all_match_len = 4;
+        settings.max_len_to_insert_all_substr = 4;
 
         let mut lz: Box<
             LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
@@ -829,6 +848,37 @@ mod tests {
         assert_eq!(compressed_out[6], LZOutput::Lit(5));
         assert_eq!(compressed_out[7], LZOutput::Lit(1));
         assert_eq!(compressed_out[8], LZOutput::Ref { disp: 5, len: 4 });
+    }
+
+    #[test]
+    fn lz_deferred_insert_sike() {
+        let mut settings = LZSettings::default();
+        settings.defer_output_match = true;
+        settings.good_enough_defer_len = 3;
+
+        let mut lz: Box<
+            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        lz.compress(
+            &settings,
+            &[1, 2, 3, 2, 3, 4, 5, 1, 2, 3, 4, 5],
+            true,
+            |x| compressed_out.push(x),
+        );
+
+        assert_eq!(compressed_out.len(), 10);
+        assert_eq!(compressed_out[0], LZOutput::Lit(1));
+        assert_eq!(compressed_out[1], LZOutput::Lit(2));
+        assert_eq!(compressed_out[2], LZOutput::Lit(3));
+        assert_eq!(compressed_out[3], LZOutput::Lit(2));
+        assert_eq!(compressed_out[4], LZOutput::Lit(3));
+        assert_eq!(compressed_out[5], LZOutput::Lit(4));
+        assert_eq!(compressed_out[6], LZOutput::Lit(5));
+        assert_eq!(compressed_out[7], LZOutput::Ref { disp: 7, len: 3 });
+        // the defer doesn't kick in because this match is good enough
+        assert_eq!(compressed_out[8], LZOutput::Lit(4));
+        assert_eq!(compressed_out[9], LZOutput::Lit(5));
     }
 
     #[test]
