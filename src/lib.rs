@@ -14,7 +14,7 @@ pub struct LZSettings {
     // only follow the hash table at most this many times
     pub max_prev_chain_follows: u64,
     // try one position forward to see if it gets better matches
-    pub try_lazy_additional_byte: bool,
+    pub defer_output_match: bool,
 }
 
 impl Default for LZSettings {
@@ -23,7 +23,7 @@ impl Default for LZSettings {
             good_enough_match_len: u64::MAX,
             max_insert_all_match_len: u64::MAX,
             max_prev_chain_follows: u64::MAX,
-            try_lazy_additional_byte: false,
+            defer_output_match: false,
         }
     }
 }
@@ -32,6 +32,13 @@ impl Default for LZSettings {
 pub enum LZOutput {
     Lit(u8),
     Ref { disp: u64, len: u64 },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct DeferredMatch {
+    first_byte: u8,
+    best_match_pos: u64,
+    best_match_len: u64,
 }
 
 pub struct LZEngine<
@@ -50,6 +57,7 @@ pub struct LZEngine<
     h: HashBits<MIN_MATCH, HASH_BITS, HASH_SZ, DICT_BITS, DICT_SZ>,
     redo_hash_at_cursor: bool,
     redo_hash_behind_cursor_num_missing: u8,
+    deferred_match: Option<DeferredMatch>,
 }
 
 impl<
@@ -92,6 +100,7 @@ impl<
             h: HashBits::new(),
             redo_hash_at_cursor: true,
             redo_hash_behind_cursor_num_missing: 0,
+            deferred_match: None,
         }
     }
     pub fn new_boxed() -> Box<Self> {
@@ -111,6 +120,7 @@ impl<
             HashBits::initialize_at(core::ptr::addr_of_mut!((*p).h));
             (*p).redo_hash_at_cursor = true;
             (*p).redo_hash_behind_cursor_num_missing = 0;
+            (*p).deferred_match = None;
             Box::from_raw(p)
         }
     }
@@ -236,35 +246,143 @@ impl<
                 }
             }
 
-            if best_match_len < MIN_MATCH {
-                // output a literal
-                outp(LZOutput::Lit(b));
-                win.roll_window(1);
-            } else {
-                // output a match
-                outp(LZOutput::Ref {
-                    disp: win.cursor_pos() - best_match_pos,
-                    len: best_match_len as u64,
-                });
-                if best_match_len as u64 <= settings.max_insert_all_match_len {
-                    self.h
-                        .put_span_into_htab(&cursor_spans, win.cursor_pos(), best_match_len);
-                    let avail_extra_bytes = cursor_spans.len() - best_match_len;
-                    println!("match -- {} extra bytes", avail_extra_bytes);
-                    if avail_extra_bytes < MIN_MATCH {
-                        self.redo_hash_behind_cursor_num_missing =
-                            (MIN_MATCH - avail_extra_bytes) as u8;
+            if settings.defer_output_match {
+                if let Some(deferred_match) = self.deferred_match {
+                    if deferred_match.best_match_len >= best_match_len as u64 {
+                        // if there is a deferred match, and it's better than this one,
+                        // then output the deferred one now
+
+                        println!(
+                            "deferred match of {} @ {:08X} is better than this ({})",
+                            deferred_match.best_match_len,
+                            deferred_match.best_match_pos,
+                            best_match_len,
+                        );
+
+                        outp(LZOutput::Ref {
+                            // cursor has been advanced one position
+                            disp: win.cursor_pos() - 1 - deferred_match.best_match_pos,
+                            len: deferred_match.best_match_len,
+                        });
+
+                        let match_len_minus_1 = (deferred_match.best_match_len - 1) as usize;
+                        if deferred_match.best_match_len <= settings.max_insert_all_match_len {
+                            // because of the advancing of one position, the hash starting at cursor_pos() is already inserted
+                            // put_span_into_htab starts at +1, so this actually starts at cursor_pos()+1
+                            let deferred_span =
+                                win.get_next_spans(win.cursor_pos(), match_len_minus_1 + MIN_MATCH);
+                            debug_assert!(deferred_span.len() >= match_len_minus_1);
+                            self.h.put_span_into_htab(
+                                &deferred_span,
+                                win.cursor_pos(),
+                                match_len_minus_1,
+                            );
+                            let avail_extra_bytes = deferred_span.len() - match_len_minus_1;
+                            println!("match -- {} extra bytes", avail_extra_bytes);
+                            if avail_extra_bytes < MIN_MATCH {
+                                self.redo_hash_behind_cursor_num_missing =
+                                    (MIN_MATCH - avail_extra_bytes) as u8;
+                            }
+                        } else {
+                            self.redo_hash_at_cursor = true;
+                        }
+                        win.roll_window(match_len_minus_1);
+                        self.deferred_match = None;
+                    } else {
+                        // there is a deferred match, but it's worse than this one
+                        // output the first char, then save current as deferred
+
+                        println!(
+                            "deferred match of {} @ {:08X} = {:02X} is worse than this ({} @ {:08X} = {:02X})",
+                            deferred_match.best_match_len,
+                            deferred_match.best_match_pos,
+                            deferred_match.first_byte,
+                            best_match_len,
+                            best_match_pos,
+                            b,
+                        );
+
+                        outp(LZOutput::Lit(deferred_match.first_byte));
+                        self.deferred_match = Some(DeferredMatch {
+                            first_byte: b,
+                            best_match_pos,
+                            best_match_len: best_match_len as u64,
+                        });
+                        win.roll_window(1);
                     }
                 } else {
-                    self.redo_hash_at_cursor = true;
+                    // no deferred match
+                    if best_match_len < MIN_MATCH {
+                        // no match here either
+                        outp(LZOutput::Lit(b));
+                    } else {
+                        // a match here, let's defer it
+
+                        println!(
+                            "deferring a match of {} @ {:08X} = {:02X}",
+                            best_match_len, best_match_pos, b
+                        );
+
+                        self.deferred_match = Some(DeferredMatch {
+                            first_byte: b,
+                            best_match_pos,
+                            best_match_len: best_match_len as u64,
+                        });
+                    }
+                    // advance one position in any case
+                    win.roll_window(1);
                 }
-                win.roll_window(best_match_len);
+            } else {
+                if best_match_len < MIN_MATCH {
+                    // output a literal
+                    outp(LZOutput::Lit(b));
+                    win.roll_window(1);
+                } else {
+                    // output a match
+                    outp(LZOutput::Ref {
+                        disp: win.cursor_pos() - best_match_pos,
+                        len: best_match_len as u64,
+                    });
+                    if best_match_len as u64 <= settings.max_insert_all_match_len {
+                        self.h
+                            .put_span_into_htab(&cursor_spans, win.cursor_pos(), best_match_len);
+                        let avail_extra_bytes = cursor_spans.len() - best_match_len;
+                        println!("match -- {} extra bytes", avail_extra_bytes);
+                        if avail_extra_bytes < MIN_MATCH {
+                            self.redo_hash_behind_cursor_num_missing =
+                                (MIN_MATCH - avail_extra_bytes) as u8;
+                        }
+                    } else {
+                        self.redo_hash_at_cursor = true;
+                    }
+                    win.roll_window(best_match_len);
+                }
             }
         }
 
         if win.tot_ahead_sz() > 0 {
             debug_assert!(win.tot_ahead_sz() <= LOOKAHEAD_SZ);
             win.roll_window(0);
+        }
+
+        if end_of_stream {
+            if let Some(deferred_match) = self.deferred_match {
+                // output last deferred match
+                // ignore window, EOS
+
+                println!(
+                    "last deferred match of {} @ {:08X} = {:02X}",
+                    deferred_match.best_match_len,
+                    deferred_match.best_match_pos,
+                    deferred_match.first_byte,
+                );
+
+                outp(LZOutput::Ref {
+                    // cursor has been advanced one position
+                    disp: win.cursor_pos() - 1 - deferred_match.best_match_pos,
+                    len: deferred_match.best_match_len,
+                });
+            }
         }
     }
 }
@@ -683,5 +801,89 @@ mod tests {
         assert_eq!(compressed_out[3], LZOutput::Ref { disp: 3, len: 6 });
         assert_eq!(compressed_out[4], LZOutput::Lit(0x78));
         assert_eq!(compressed_out[5], LZOutput::Ref { disp: 7, len: 3 });
+    }
+
+    #[test]
+    fn lz_deferred_insert() {
+        let mut settings = LZSettings::default();
+        settings.defer_output_match = true;
+
+        let mut lz: Box<
+            LZEngine<256, 8, { 256 + 8 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        lz.compress(
+            &settings,
+            &[1, 2, 3, 2, 3, 4, 5, 1, 2, 3, 4, 5],
+            true,
+            |x| compressed_out.push(x),
+        );
+
+        assert_eq!(compressed_out.len(), 9);
+        assert_eq!(compressed_out[0], LZOutput::Lit(1));
+        assert_eq!(compressed_out[1], LZOutput::Lit(2));
+        assert_eq!(compressed_out[2], LZOutput::Lit(3));
+        assert_eq!(compressed_out[3], LZOutput::Lit(2));
+        assert_eq!(compressed_out[4], LZOutput::Lit(3));
+        assert_eq!(compressed_out[5], LZOutput::Lit(4));
+        assert_eq!(compressed_out[6], LZOutput::Lit(5));
+        assert_eq!(compressed_out[7], LZOutput::Lit(1));
+        assert_eq!(compressed_out[8], LZOutput::Ref { disp: 5, len: 4 });
+    }
+
+    #[test]
+    fn lz_big_file_defer() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("src/lib.rs");
+        let outp_fn = d.join("test3.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut settings = LZSettings::default();
+        settings.defer_output_match = true;
+        let mut lz: Box<
+            LZEngine<32768, 256, { 32768 + 256 }, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }, 1>,
+        > = LZEngine::new_boxed();
+        let mut compressed_out = Vec::new();
+        for i in 0..inp.len() {
+            lz.compress(&settings, &[inp[i]], false, |x| compressed_out.push(x));
+        }
+        lz.compress(&settings, &[], true, |x| compressed_out.push(x));
+
+        let mut outp_f = BufWriter::new(File::create(outp_fn).unwrap());
+        for &lz_tok in &compressed_out {
+            match lz_tok {
+                LZOutput::Lit(lit) => {
+                    outp_f.write(&[0]).unwrap();
+                    outp_f.write(&[lit]).unwrap();
+                }
+                LZOutput::Ref { disp, len } => {
+                    outp_f.write(&[0xff]).unwrap();
+                    outp_f.write(&disp.to_le_bytes()).unwrap();
+                    outp_f.write(&len.to_le_bytes()).unwrap();
+                }
+            }
+        }
+
+        let mut decompress = Vec::new();
+        for &lz_tok in &compressed_out {
+            match lz_tok {
+                LZOutput::Lit(lit) => {
+                    decompress.push(lit);
+                }
+                LZOutput::Ref { disp, len } => {
+                    assert!(len > 0);
+                    assert!(len <= 256);
+                    assert!(disp >= 1);
+                    assert!(disp <= 32768);
+                    for _ in 0..len {
+                        decompress.push(decompress[decompress.len() - disp as usize]);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(inp, decompress);
     }
 }
