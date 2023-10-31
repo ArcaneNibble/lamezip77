@@ -73,23 +73,13 @@ impl<
         debug_assert!(span.len() >= len);
 
         for i in 1..len {
-            println!(
-                "span -- hash @ {:08X} is {:04X}",
-                cur_offs + i as u64,
-                self.hash_of_head
-            );
-
             if i + MIN_MATCH <= span.len() {
                 self.put_raw_into_htab(self.hash_of_head, cur_offs + i as u64);
-            } else {
-                println!("span -- skipping htab update, out of range")
             }
 
             if i + MIN_MATCH < span.len() {
                 let b = span[i + MIN_MATCH];
                 self.hash_of_head = self.calc_new_hash(self.hash_of_head, b);
-            } else {
-                println!("span -- skipping hash update, out of range")
             }
         }
     }

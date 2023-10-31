@@ -145,28 +145,19 @@ impl<
         if !settings.defer_output_match {
             if let Some(deferred_match) = self.deferred_match {
                 // XXX this is not tested
-                println!("dump out deferred match");
                 outp(LZOutput::Lit(deferred_match.first_byte));
                 self.deferred_match = None;
             }
         }
 
-        println!("tot ahead {}", win.tot_ahead_sz());
         while win.tot_ahead_sz() > if end_of_stream { 0 } else { LOOKAHEAD_SZ } {
             if self.redo_hash_behind_cursor_num_missing > 0 {
-                println!(
-                    "redo behind cursor @ {:08X} # {}",
-                    win.cursor_pos(),
-                    self.redo_hash_behind_cursor_num_missing
-                );
-
                 // we know there is >= 1 byte always, and >= LOOKAHEAD_SZ + 1 (aka >= MIN_MATCH + 1) bytes if not EOS
                 // FIXME change EOS to flush??
 
                 let mut hash = self.h.hash_of_head;
 
                 for i in (0..self.redo_hash_behind_cursor_num_missing).rev() {
-                    println!("redo behind pos -{} old hash {:04X}", i, hash);
                     // when we are in this situation, there is always one more htab update than hash update
                     // so we start with a hash update
                     hash = self
@@ -175,12 +166,6 @@ impl<
 
                     if i != 0 {
                         let old_hpos = self.h.put_raw_into_htab(hash, win.cursor_pos() - i as u64);
-                        println!(
-                            "redo behind pos insert @ {:08X} is {:04X} old {:08X}",
-                            win.cursor_pos() - i as u64,
-                            hash,
-                            old_hpos
-                        );
                     }
                 }
 
@@ -189,7 +174,6 @@ impl<
             }
 
             if self.redo_hash_at_cursor {
-                println!("redo at cursor @ {:08X}", win.cursor_pos());
                 // we need to prime the hash table by recomputing the hash for cursor
                 // either at the start or after a span
 
@@ -205,15 +189,8 @@ impl<
             }
 
             let b: u8 = win.peek_byte(0);
-            println!(
-                "working @ {:08X} with val {:02X} cur hash {:04X}",
-                win.cursor_pos(),
-                b,
-                self.h.hash_of_head
-            );
 
             let mut old_hpos = self.h.put_head_into_htab(&win);
-            println!("hash pointer is {:08X}", old_hpos);
 
             let mut best_match_endpeek = b;
             let mut best_match_len = 1;
@@ -253,7 +230,6 @@ impl<
                 {
                     prev_follow_limit -= 1;
                     let eval_hpos = old_hpos;
-                    println!("probing at {:08X}", eval_hpos);
                     old_hpos = self.h.prev[(old_hpos & ((1 << DICT_BITS) - 1)) as usize];
 
                     if !(eval_hpos + MIN_DISP <= win.cursor_pos()) {
@@ -266,12 +242,10 @@ impl<
                     // optimization because the match can't get better if it
                     // doesn't match the best one we've got up to the best length we've got
                     if lookback_spans[best_match_len - 1] != best_match_endpeek {
-                        println!("peek skip");
                         continue;
                     }
 
                     let match_len = lookback_spans.compare(&cursor_spans);
-                    println!("match len {} span len {}", match_len, lookback_spans.len());
                     debug_assert!(match_len <= MAX_MATCH);
                     if match_len >= MIN_MATCH {
                         if match_len > best_match_len {
@@ -292,13 +266,6 @@ impl<
                         // if there is a deferred match, and it's better than this one,
                         // then output the deferred one now
 
-                        println!(
-                            "deferred match of {} @ {:08X} is better than this ({})",
-                            deferred_match.best_match_len,
-                            deferred_match.best_match_pos,
-                            best_match_len,
-                        );
-
                         outp(LZOutput::Ref {
                             // cursor has been advanced one position
                             disp: win.cursor_pos() - 1 - deferred_match.best_match_pos,
@@ -318,7 +285,6 @@ impl<
                                 match_len_minus_1,
                             );
                             let avail_extra_bytes = deferred_span.len() - match_len_minus_1;
-                            println!("match -- {} extra bytes", avail_extra_bytes);
                             if avail_extra_bytes < MIN_MATCH {
                                 self.redo_hash_behind_cursor_num_missing =
                                     (MIN_MATCH - avail_extra_bytes) as u8;
@@ -331,16 +297,6 @@ impl<
                     } else {
                         // there is a deferred match, but it's worse than this one
                         // output the first char, then save current as deferred
-
-                        println!(
-                            "deferred match of {} @ {:08X} = {:02X} is worse than this ({} @ {:08X} = {:02X})",
-                            deferred_match.best_match_len,
-                            deferred_match.best_match_pos,
-                            deferred_match.first_byte,
-                            best_match_len,
-                            best_match_pos,
-                            b,
-                        );
 
                         outp(LZOutput::Lit(deferred_match.first_byte));
                         self.deferred_match = Some(DeferredMatch {
@@ -357,11 +313,6 @@ impl<
                         outp(LZOutput::Lit(b));
                     } else {
                         // a match here, let's defer it
-
-                        println!(
-                            "deferring a match of {} @ {:08X} = {:02X}",
-                            best_match_len, best_match_pos, b
-                        );
 
                         self.deferred_match = Some(DeferredMatch {
                             first_byte: b,
@@ -387,7 +338,6 @@ impl<
                         self.h
                             .put_span_into_htab(&cursor_spans, win.cursor_pos(), best_match_len);
                         let avail_extra_bytes = cursor_spans.len() - best_match_len;
-                        println!("match -- {} extra bytes", avail_extra_bytes);
                         if avail_extra_bytes < MIN_MATCH {
                             self.redo_hash_behind_cursor_num_missing =
                                 (MIN_MATCH - avail_extra_bytes) as u8;
@@ -410,13 +360,6 @@ impl<
             if let Some(deferred_match) = self.deferred_match {
                 // output last deferred match
                 // ignore window, EOS
-
-                println!(
-                    "last deferred match of {} @ {:08X} = {:02X}",
-                    deferred_match.best_match_len,
-                    deferred_match.best_match_pos,
-                    deferred_match.first_byte,
-                );
 
                 outp(LZOutput::Ref {
                     // cursor has been advanced one position
