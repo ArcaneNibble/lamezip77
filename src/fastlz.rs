@@ -2,6 +2,32 @@ use std::error::Error;
 
 use crate::util::*;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DecompressState {
+    Opcode0_start,
+    Opcode0_lv1,
+    Opcode_lv1_morelen,
+    Opcode_lv1_moredisp,
+    LiteralRun_lv1(u8),
+    Opcode0_lv2,
+    Opcode_lv2_morelen,
+    Opcode_lv2_moredisp0,
+    Opcode_lv2_moredisp1,
+    Opcode_lv2_moredisp2,
+    LiteralRun_lv2(u8),
+}
+
+impl DecompressState {
+    const fn is_at_boundary(&self) -> bool {
+        match self {
+            DecompressState::Opcode0_start
+            | DecompressState::Opcode0_lv1
+            | DecompressState::Opcode0_lv2 => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecompressError {
     BadCompressionLevel(u8),
@@ -31,6 +57,160 @@ impl core::fmt::Display for DecompressError {
 }
 
 impl Error for DecompressError {}
+
+// max size for level 2 (level 1 is smaller)
+const LOOKBACK_SZ: usize = 0xFFFF + 0x1FFF + 1;
+
+// technically copy-able, but don't want to make it easy to accidentally do so
+#[derive(Clone)]
+pub struct DecompressStreaming {
+    lookback: [u8; LOOKBACK_SZ],
+    lookback_wptr: usize,
+    lookback_avail: usize,
+    state: DecompressState,
+    matchlen: usize,
+    matchdisp: usize,
+}
+
+impl DecompressStreaming {
+    pub fn new() -> Self {
+        Self {
+            lookback: [0; LOOKBACK_SZ],
+            lookback_wptr: 0,
+            lookback_avail: 0,
+            state: DecompressState::Opcode0_start,
+            matchlen: 0,
+            matchdisp: 0,
+        }
+    }
+    pub fn new_boxed() -> Box<Self> {
+        unsafe {
+            let layout = core::alloc::Layout::new::<Self>();
+            let p = std::alloc::alloc(layout) as *mut Self;
+            let p_lookback = core::ptr::addr_of_mut!((*p).lookback);
+            for i in 0..LOOKBACK_SZ {
+                // my understanding is that this is safe because u64 doesn't have Drop
+                // and we don't construct a & anywhere
+                (*p_lookback)[i] = 0;
+            }
+            (*p).lookback_wptr = 0;
+            (*p).lookback_avail = 0;
+            (*p).state = DecompressState::Opcode0_start;
+            (*p).matchlen = 0;
+            (*p).matchdisp = 0;
+            Box::from_raw(p)
+        }
+    }
+
+    pub fn decompress<O>(&mut self, mut inp: &[u8], mut outp: O) -> Result<bool, DecompressError>
+    where
+        O: FnMut(u8),
+    {
+        while inp.len() > 0 {
+            let b = get_inp::<1>(&mut inp).unwrap()[0];
+            println!("state {:?} byte {:08b}", self.state, b);
+
+            match self.state {
+                DecompressState::Opcode0_start => {
+                    let level = b >> 5;
+                    let nlit = (b & 0b11111) + 1;
+                    println!("lits: {}", nlit);
+
+                    if level == 0 {
+                        self.state = DecompressState::LiteralRun_lv1(nlit);
+                    } else if level == 1 {
+                        self.state = DecompressState::LiteralRun_lv2(nlit);
+                    } else {
+                        return Err(DecompressError::BadCompressionLevel(level));
+                    }
+                }
+                DecompressState::Opcode0_lv1 => {
+                    let matchlen = (b >> 5) as usize + 2;
+                    let matchdisp = ((b & 0b11111) as usize) << 8;
+
+                    println!("matchlen {} matchdisp {}", matchlen, matchdisp);
+                    self.matchlen = matchlen;
+                    self.matchdisp = matchdisp;
+
+                    if matchlen == 0b000 + 2 {
+                        let nlit = (b & 0b11111) + 1;
+                        println!("lits: {}", nlit);
+                        self.state = DecompressState::LiteralRun_lv1(nlit);
+                    } else if matchlen == 0b111 + 2 {
+                        self.state = DecompressState::Opcode_lv1_morelen;
+                    } else {
+                        self.state = DecompressState::Opcode_lv1_moredisp;
+                    }
+                }
+                DecompressState::Opcode_lv1_morelen => {
+                    self.matchlen += b as usize;
+                    println!("matchlen {}", self.matchlen);
+                    self.state = DecompressState::Opcode_lv1_moredisp;
+                }
+                DecompressState::Opcode_lv1_moredisp => {
+                    self.matchdisp |= b as usize;
+                    println!("matchdisp {}", self.matchdisp);
+
+                    println!("match disp -{} len {}", self.matchdisp + 1, self.matchlen);
+
+                    if self.matchdisp + 1 > self.lookback_avail {
+                        return Err(DecompressError::BadLookback {
+                            disp: self.matchdisp as u32,
+                            avail: self.lookback_avail as u32,
+                        });
+                    }
+
+                    for _ in 0..self.matchlen {
+                        let idx =
+                            (self.lookback_wptr + LOOKBACK_SZ - self.matchdisp - 1) % LOOKBACK_SZ;
+                        let copy_b = self.lookback[idx];
+                        outp(copy_b);
+                        self.lookback[self.lookback_wptr] = copy_b;
+                        self.lookback_wptr = (self.lookback_wptr + 1) % LOOKBACK_SZ;
+                        if self.lookback_avail < LOOKBACK_SZ {
+                            self.lookback_avail += 1;
+                        }
+                    }
+
+                    self.state = DecompressState::Opcode0_lv1;
+                }
+                DecompressState::Opcode0_lv2 => todo!(),
+                DecompressState::Opcode_lv2_morelen => todo!(),
+                DecompressState::Opcode_lv2_moredisp0 => todo!(),
+                DecompressState::Opcode_lv2_moredisp1 => todo!(),
+                DecompressState::Opcode_lv2_moredisp2 => todo!(),
+                DecompressState::LiteralRun_lv1(nlit) | DecompressState::LiteralRun_lv2(nlit) => {
+                    outp(b);
+                    self.lookback[self.lookback_wptr] = b;
+                    self.lookback_wptr = (self.lookback_wptr + 1) % LOOKBACK_SZ;
+                    if self.lookback_avail < LOOKBACK_SZ {
+                        self.lookback_avail += 1;
+                    }
+
+                    match self.state {
+                        DecompressState::LiteralRun_lv1(_) => {
+                            if nlit != 1 {
+                                self.state = DecompressState::LiteralRun_lv1(nlit - 1);
+                            } else {
+                                self.state = DecompressState::Opcode0_lv1;
+                            }
+                        }
+                        DecompressState::LiteralRun_lv2(_) => {
+                            if nlit != 1 {
+                                self.state = DecompressState::LiteralRun_lv2(nlit - 1);
+                            } else {
+                                self.state = DecompressState::Opcode0_lv2;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+
+        Ok(self.state.is_at_boundary())
+    }
+}
 
 #[derive(Copy, Clone)]
 pub struct DecompressBuffered {}
@@ -187,10 +367,15 @@ impl DecompressBuffered {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::File,
+        io::{BufWriter, Write},
+    };
+
     use super::*;
 
     #[test]
-    fn flz_ref_decompress_1() {
+    fn flz_buffered_ref_decompress_1() {
         let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
         let inp_fn = d.join("tests/fastlz.lv1.bin");
@@ -206,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn flz_zeros_decompress_1() {
+    fn flz_buffered_zeros_decompress_1() {
         let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
         let inp_fn = d.join("tests/fastlz-zeros.lv1.bin");
@@ -220,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn flz_ref_decompress_2() {
+    fn flz_buffered_ref_decompress_2() {
         let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
         let inp_fn = d.join("tests/fastlz.lv2.bin");
@@ -236,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn flz_zeros_decompress_2() {
+    fn flz_buffered_zeros_decompress_2() {
         let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
         let inp_fn = d.join("tests/fastlz-zeros.lv2.bin");
@@ -245,6 +430,47 @@ mod tests {
 
         let dec = DecompressBuffered::new();
         let out = dec.decompress_new(&inp, usize::MAX).unwrap();
+
+        assert_eq!(out, vec![0; 256 * 1024]);
+    }
+
+    #[test]
+    fn flz_streaming_ref_decompress_1() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("tests/fastlz.lv1.bin");
+        let ref_fn = d.join("fastlztest/tool.c");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+        let ref_ = std::fs::read(ref_fn).unwrap();
+
+        let mut dec = DecompressStreaming::new_boxed();
+        let mut out = Vec::new();
+
+        for b in inp {
+            dec.decompress(&[b], |x| out.push(x)).unwrap();
+        }
+
+        let mut outp_f = BufWriter::new(File::create(d.join("dump.bin")).unwrap());
+        outp_f.write(&out).unwrap();
+
+        assert_eq!(out, ref_);
+    }
+
+    #[test]
+    fn flz_streaming_zeros_decompress_1() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("tests/fastlz-zeros.lv1.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut dec = DecompressStreaming::new_boxed();
+        let mut out = Vec::new();
+
+        for b in inp {
+            dec.decompress(&[b], |x| out.push(x)).unwrap();
+        }
 
         assert_eq!(out, vec![0; 256 * 1024]);
     }
