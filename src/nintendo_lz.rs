@@ -1,5 +1,6 @@
 use std::error::Error;
 
+use crate::util::*;
 use crate::{LZEngine, LZOutput, LZSettings};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -121,44 +122,35 @@ impl DecompressStreaming {
         O: FnMut(u8),
     {
         while inp.len() > 0 && self.need_more_bytes() {
+            let b = get_inp::<1>(&mut inp).unwrap()[0];
+
             match self.state {
                 DecompressState::HdrMagic => {
-                    let magic = inp[0];
-                    inp = &inp[1..];
-                    if magic != 0x10 {
-                        return Err(DecompressError::BadMagic(magic));
+                    if b != 0x10 {
+                        return Err(DecompressError::BadMagic(b));
                     }
                     self.state = DecompressState::HdrLen0;
                 }
                 DecompressState::HdrLen0 => {
-                    let b = inp[0];
-                    inp = &inp[1..];
                     self.remaining_bytes = b as u32;
                     self.state = DecompressState::HdrLen1;
                 }
                 DecompressState::HdrLen1 => {
-                    let b = inp[0];
-                    inp = &inp[1..];
                     self.remaining_bytes = self.remaining_bytes | ((b as u32) << 8);
                     self.state = DecompressState::HdrLen2;
                 }
                 DecompressState::HdrLen2 => {
-                    let b = inp[0];
-                    inp = &inp[1..];
                     self.remaining_bytes = self.remaining_bytes | ((b as u32) << 16);
                     self.state = DecompressState::BlockFlags;
                 }
                 DecompressState::BlockFlags => {
-                    let b = inp[0];
-                    inp = &inp[1..];
                     self.block_flags = b;
                     self.block_i = 0;
                     self.state = DecompressState::BlockData0;
                 }
                 DecompressState::BlockData0 => {
                     if self.block_flags & (1 << (7 - self.block_i)) == 0 {
-                        let lit = inp[0];
-                        inp = &inp[1..];
+                        let lit = b;
                         outp(lit);
                         self.remaining_bytes -= 1;
                         self.lookback[self.lookback_wptr] = lit;
@@ -172,16 +164,11 @@ impl DecompressStreaming {
                             self.state = DecompressState::BlockFlags;
                         }
                     } else {
-                        let b = inp[0];
-                        inp = &inp[1..];
                         self.match_b0 = b;
                         self.state = DecompressState::BlockData1;
                     }
                 }
                 DecompressState::BlockData1 => {
-                    let b = inp[0];
-                    inp = &inp[1..];
-
                     let disp = (b as usize) | (((self.match_b0 & 0xF) as usize) << 8);
                     let len = (self.match_b0 >> 4) as usize;
 
@@ -230,26 +217,23 @@ impl DecompressBuffered {
         Self {}
     }
 
-    pub fn decompress_into(&self, mut inp: &[u8], outp: &mut [u8]) -> Result<(), DecompressError> {
-        if inp.len() < 4 {
-            return Err(DecompressError::TooShort);
+    fn decompress<B>(&self, mut inp: &[u8], outp: &mut B) -> Result<(), DecompressError>
+    where
+        B: MaybeGrowableBuf,
+    {
+        let magic = get_inp::<4>(&mut inp).map_err(|_| DecompressError::TooShort)?;
+        if magic[0] != 0x10 {
+            return Err(DecompressError::BadMagic(magic[0]));
         }
-        let encoded_len = (inp[1] as usize) | ((inp[2] as usize) << 8) | ((inp[3] as usize) << 16);
-        let wanted_len = core::cmp::min(encoded_len, outp.len());
-        let mut outpos = 0;
+        let encoded_len =
+            (magic[1] as usize) | ((magic[2] as usize) << 8) | ((magic[3] as usize) << 16);
+        let wanted_len = core::cmp::min(encoded_len, outp.limit());
 
-        inp = &inp[4..];
-
-        while outpos < wanted_len {
-            if inp.len() == 0 {
-                return Err(DecompressError::TooShort);
-            }
-
-            let flags = inp[0];
-            inp = &inp[1..];
+        while outp.cur_pos() < wanted_len {
+            let flags = get_inp::<1>(&mut inp).map_err(|_| DecompressError::TooShort)?[0];
 
             for i in (0..8).rev() {
-                if outpos == wanted_len {
+                if outp.cur_pos() == wanted_len {
                     break;
                 }
 
@@ -257,30 +241,20 @@ impl DecompressBuffered {
                     if inp.len() == 0 {
                         return Err(DecompressError::TooShort);
                     }
-                    let b = inp[0];
-                    inp = &inp[1..];
-                    outp[outpos] = b;
-                    outpos += 1;
+                    let b = get_inp::<1>(&mut inp).map_err(|_| DecompressError::TooShort)?[0];
+                    outp.add_lit(b);
                 } else {
-                    if inp.len() < 2 {
-                        return Err(DecompressError::TooShort);
-                    }
-                    let disp = (inp[1] as usize) | (((inp[0] & 0xF) as usize) << 8);
-                    let len = (inp[0] >> 4) as usize;
-                    inp = &inp[2..];
+                    let matchb = get_inp::<2>(&mut inp).map_err(|_| DecompressError::TooShort)?;
+                    let disp = (matchb[1] as usize) | (((matchb[0] & 0xF) as usize) << 8);
+                    let len = (matchb[0] >> 4) as usize;
 
-                    if disp + 1 > outpos {
-                        return Err(DecompressError::BadLookback {
+                    let len = core::cmp::min(len + 3, wanted_len - outp.cur_pos());
+
+                    outp.add_match(disp + 1, len)
+                        .map_err(|_| DecompressError::BadLookback {
                             disp: disp as u16,
-                            avail: outpos as u16,
-                        });
-                    }
-
-                    let len = core::cmp::min(len + 3, wanted_len - outpos);
-                    for j in 0..len {
-                        outp[outpos + j] = outp[outpos - disp - 1 + j];
-                    }
-                    outpos += len;
+                            avail: outp.cur_pos() as u16,
+                        })?;
                 }
             }
         }
@@ -288,14 +262,18 @@ impl DecompressBuffered {
         Ok(())
     }
 
+    pub fn decompress_into(&self, inp: &[u8], outp: &mut [u8]) -> Result<(), DecompressError> {
+        self.decompress(inp, &mut FixedBuf::from(outp))
+    }
+
     pub fn decompress_new(&self, inp: &[u8]) -> Result<Vec<u8>, DecompressError> {
         if inp.len() < 4 {
             return Err(DecompressError::TooShort);
         }
         let encoded_len = (inp[1] as usize) | ((inp[2] as usize) << 8) | ((inp[3] as usize) << 16);
-        let mut ret = vec![0; encoded_len];
-        self.decompress_into(inp, &mut ret[..])?;
-        Ok(ret)
+        let mut buf = VecBuf::new(encoded_len, encoded_len);
+        self.decompress(inp, &mut buf)?;
+        Ok(buf.into())
     }
 }
 
