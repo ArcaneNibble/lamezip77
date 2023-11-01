@@ -18,6 +18,8 @@ pub struct LZSettings {
     pub search_faster_defer_len: u64,
     // this is used for nintendo lz s.t. a disp of -1 won't be used
     pub min_disp: u64,
+    // some formats need this for reasons
+    pub eos_holdout_bytes: u64,
 }
 
 impl Default for LZSettings {
@@ -30,6 +32,7 @@ impl Default for LZSettings {
             good_enough_defer_len: u64::MAX,
             search_faster_defer_len: u64::MAX,
             min_disp: 1,
+            eos_holdout_bytes: 0,
         }
     }
 }
@@ -145,6 +148,7 @@ impl<
         O: FnMut(LZOutput),
     {
         assert!(settings.min_disp >= 1);
+        assert!(settings.eos_holdout_bytes <= LOOKAHEAD_SZ as u64);
 
         let mut win = self.sbuf.add_inp(inp);
 
@@ -156,7 +160,13 @@ impl<
             }
         }
 
-        while win.tot_ahead_sz() > if end_of_stream { 0 } else { LOOKAHEAD_SZ } {
+        let required_min_bytes_left = if end_of_stream {
+            settings.eos_holdout_bytes as usize
+        } else {
+            LOOKAHEAD_SZ
+        };
+
+        while win.tot_ahead_sz() > required_min_bytes_left {
             if self.redo_hash_behind_cursor_num_missing > 0 {
                 // we know there is >= 1 byte always, and >= LOOKAHEAD_SZ + 1 (aka >= MIN_MATCH + 1) bytes if not EOS
                 // FIXME change EOS to flush??
@@ -203,7 +213,12 @@ impl<
             let mut best_match_pos = u64::MAX;
 
             // this is what we're matching against
-            let max_match = MAX_MATCH.try_into().unwrap_or(usize::MAX - MIN_MATCH - 1);
+            let max_match = if end_of_stream && settings.eos_holdout_bytes > 0 {
+                win.tot_ahead_sz() - settings.eos_holdout_bytes as usize
+            } else {
+                // xxx this overflow prevention is broken
+                MAX_MATCH.try_into().unwrap_or(usize::MAX - MIN_MATCH - 1)
+            };
             // extra few bytes in the hopes that we don't have to
             // do the redo_hash_behind_cursor_num_missing calculation
             let cursor_spans = win.get_next_spans(win.cursor_pos(), max_match + MIN_MATCH + 1);
@@ -373,6 +388,16 @@ impl<
                     len: deferred_match.best_match_len,
                 });
             }
+
+            if settings.eos_holdout_bytes > 0 {
+                // dump these out as literals
+                debug_assert!(win.tot_ahead_sz() as u64 == settings.eos_holdout_bytes);
+                while win.tot_ahead_sz() > 0 {
+                    outp(LZOutput::Lit(win.peek_byte(0)));
+                    win.roll_window(1);
+                }
+            }
+            assert!(win.tot_ahead_sz() == 0);
         }
     }
 }

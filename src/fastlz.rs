@@ -431,13 +431,13 @@ impl CompressLevel1 {
             good_enough_defer_len: 64,
             search_faster_defer_len: 128,
             min_disp: 1,
+            eos_holdout_bytes: 0,
         };
 
         macro_rules! dump_lits {
             () => {
                 if self.num_buffered_lits > 0 {
                     debug_assert!(self.num_buffered_lits <= 32);
-                    println!("literal run {}", self.num_buffered_lits);
                     outp(self.num_buffered_lits - 1);
                     for i in 0..self.num_buffered_lits {
                         outp(self.buffered_lits[i as usize]);
@@ -458,8 +458,6 @@ impl CompressLevel1 {
                 }
                 LZOutput::Ref { disp, len } => {
                     dump_lits!();
-
-                    println!("match {} {}", disp, len);
 
                     let disp = disp - 1;
                     debug_assert!(disp <= 0x1FFF);
@@ -543,13 +541,15 @@ impl CompressLevel2 {
             good_enough_defer_len: 8190,
             search_faster_defer_len: 2048,
             min_disp: 1,
+            // for some reason, long matches cannot be any closer than -2 bytes from the end
+            // this guarantees that condition is met
+            eos_holdout_bytes: 1,
         };
 
         macro_rules! dump_lits {
             () => {
                 if self.num_buffered_lits > 0 {
                     debug_assert!(self.num_buffered_lits <= 32);
-                    println!("literal run {}", self.num_buffered_lits);
                     let tag = if !self.tag_emitted {
                         self.tag_emitted = true;
                         0b001_00000
@@ -576,8 +576,6 @@ impl CompressLevel2 {
                 }
                 LZOutput::Ref { disp, len } => {
                     dump_lits!();
-
-                    println!("match {} {}", disp, len);
 
                     let disp = disp - 1;
                     debug_assert!(disp <= 0x1FFF + 0xFFFF);
@@ -609,7 +607,6 @@ impl CompressLevel2 {
                     // extra long displacement
                     if disp >= 0x1FFF {
                         let disp_extra = disp - disp_non_extra;
-                        println!("disp extra {}", disp_extra);
                         debug_assert!(disp_extra <= 0xFFFF);
                         outp(((disp_extra >> 8) & 0xff) as u8);
                         outp((disp_extra & 0xff) as u8);
@@ -1044,6 +1041,50 @@ mod tests {
         assert_eq!(inp, decompress_ourselves);
 
         let ref_fn = d.join("fastlz-lv2-roundtrip-longdisp-bytewise.out");
+        Command::new("./fastlztest/tool")
+            .arg("d")
+            .arg(outp_fn.to_str().unwrap())
+            .arg(ref_fn.to_str().unwrap())
+            .status()
+            .unwrap();
+        let decompress_ref = std::fs::read(&ref_fn).unwrap();
+        assert_eq!(inp, decompress_ref);
+    }
+
+    #[test]
+    fn flz_lv2_roundtrip_longdisp_wholefile() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let outp_fn = d.join("fastlz-lv2-roundtrip-longdisp-wholefile.bin");
+        let mut inp = vec![0; 16384];
+        inp[0] = b'a';
+        inp[1] = b'b';
+        inp[2] = b'c';
+        inp[3] = b'd';
+        inp[4] = b'e';
+        inp[5] = b'f';
+        inp[6] = b'g';
+        inp[0x3ff0 + 0] = b'a';
+        inp[0x3ff0 + 1] = b'b';
+        inp[0x3ff0 + 2] = b'c';
+        inp[0x3ff0 + 3] = b'd';
+        inp[0x3ff0 + 4] = b'e';
+        inp[0x3ff0 + 5] = b'f';
+        inp[0x3ff0 + 6] = b'g';
+
+        let mut comp = CompressLevel2::new_boxed();
+        let mut compressed_out = Vec::new();
+        comp.compress(&inp, true, |x| compressed_out.push(x));
+
+        let mut outp_f = BufWriter::new(File::create(&outp_fn).unwrap());
+        outp_f.write(&compressed_out).unwrap();
+        drop(outp_f);
+
+        let dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(inp, decompress_ourselves);
+
+        let ref_fn = d.join("fastlz-lv2-roundtrip-longdisp-wholefile.out");
         Command::new("./fastlztest/tool")
             .arg("d")
             .arg(outp_fn.to_str().unwrap())

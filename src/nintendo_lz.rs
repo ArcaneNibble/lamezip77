@@ -320,6 +320,7 @@ impl Compress {
             good_enough_defer_len: 18,
             search_faster_defer_len: 10,
             min_disp: if vram_mode { 2 } else { 1 },
+            eos_holdout_bytes: 0,
         };
 
         macro_rules! dump_buffered_out {
