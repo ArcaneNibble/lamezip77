@@ -4,25 +4,25 @@ use crate::util::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DecompressState {
-    Opcode0_start,
-    Opcode0_lv1,
-    Opcode_lv1_morelen,
-    Opcode_lv1_moredisp,
-    LiteralRun_lv1(u8),
-    Opcode0_lv2,
-    Opcode_lv2_morelen,
-    Opcode_lv2_moredisp0,
-    Opcode_lv2_moredisp1,
-    Opcode_lv2_moredisp2,
-    LiteralRun_lv2(u8),
+    Opcode0Start,
+    Opcode0Lv1,
+    OpcodeLv1MoreLen,
+    OpcodeLv1MoreDisp,
+    LiteralRunLv1(u8),
+    Opcode0Lv2,
+    OpcodeLv2MoreLen,
+    OpcodeLv2MoreDisp0,
+    OpcodeLv2MoreDisp1,
+    OpcodeLv2MoreDisp2,
+    LiteralRunLv2(u8),
 }
 
 impl DecompressState {
     const fn is_at_boundary(&self) -> bool {
         match self {
-            DecompressState::Opcode0_start
-            | DecompressState::Opcode0_lv1
-            | DecompressState::Opcode0_lv2 => true,
+            DecompressState::Opcode0Start
+            | DecompressState::Opcode0Lv1
+            | DecompressState::Opcode0Lv2 => true,
             _ => false,
         }
     }
@@ -78,7 +78,7 @@ impl DecompressStreaming {
             lookback: [0; LOOKBACK_SZ],
             lookback_wptr: 0,
             lookback_avail: 0,
-            state: DecompressState::Opcode0_start,
+            state: DecompressState::Opcode0Start,
             matchlen: 0,
             matchdisp: 0,
         }
@@ -95,11 +95,38 @@ impl DecompressStreaming {
             }
             (*p).lookback_wptr = 0;
             (*p).lookback_avail = 0;
-            (*p).state = DecompressState::Opcode0_start;
+            (*p).state = DecompressState::Opcode0Start;
             (*p).matchlen = 0;
             (*p).matchdisp = 0;
             Box::from_raw(p)
         }
+    }
+
+    fn do_match<O>(&mut self, mut outp: O) -> Result<(), DecompressError>
+    where
+        O: FnMut(u8),
+    {
+        println!("match disp -{} len {}", self.matchdisp + 1, self.matchlen);
+
+        if self.matchdisp + 1 > self.lookback_avail {
+            return Err(DecompressError::BadLookback {
+                disp: self.matchdisp as u32,
+                avail: self.lookback_avail as u32,
+            });
+        }
+
+        for _ in 0..self.matchlen {
+            let idx = (self.lookback_wptr + LOOKBACK_SZ - self.matchdisp - 1) % LOOKBACK_SZ;
+            let copy_b = self.lookback[idx];
+            outp(copy_b);
+            self.lookback[self.lookback_wptr] = copy_b;
+            self.lookback_wptr = (self.lookback_wptr + 1) % LOOKBACK_SZ;
+            if self.lookback_avail < LOOKBACK_SZ {
+                self.lookback_avail += 1;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn decompress<O>(&mut self, mut inp: &[u8], mut outp: O) -> Result<bool, DecompressError>
@@ -111,20 +138,20 @@ impl DecompressStreaming {
             println!("state {:?} byte {:08b}", self.state, b);
 
             match self.state {
-                DecompressState::Opcode0_start => {
+                DecompressState::Opcode0Start => {
                     let level = b >> 5;
                     let nlit = (b & 0b11111) + 1;
                     println!("lits: {}", nlit);
 
                     if level == 0 {
-                        self.state = DecompressState::LiteralRun_lv1(nlit);
+                        self.state = DecompressState::LiteralRunLv1(nlit);
                     } else if level == 1 {
-                        self.state = DecompressState::LiteralRun_lv2(nlit);
+                        self.state = DecompressState::LiteralRunLv2(nlit);
                     } else {
                         return Err(DecompressError::BadCompressionLevel(level));
                     }
                 }
-                DecompressState::Opcode0_lv1 => {
+                DecompressState::Opcode0Lv1 => {
                     let matchlen = (b >> 5) as usize + 2;
                     let matchdisp = ((b & 0b11111) as usize) << 8;
 
@@ -135,51 +162,74 @@ impl DecompressStreaming {
                     if matchlen == 0b000 + 2 {
                         let nlit = (b & 0b11111) + 1;
                         println!("lits: {}", nlit);
-                        self.state = DecompressState::LiteralRun_lv1(nlit);
+                        self.state = DecompressState::LiteralRunLv1(nlit);
                     } else if matchlen == 0b111 + 2 {
-                        self.state = DecompressState::Opcode_lv1_morelen;
+                        self.state = DecompressState::OpcodeLv1MoreLen;
                     } else {
-                        self.state = DecompressState::Opcode_lv1_moredisp;
+                        self.state = DecompressState::OpcodeLv1MoreDisp;
                     }
                 }
-                DecompressState::Opcode_lv1_morelen => {
+                DecompressState::OpcodeLv1MoreLen => {
                     self.matchlen += b as usize;
                     println!("matchlen {}", self.matchlen);
-                    self.state = DecompressState::Opcode_lv1_moredisp;
+                    self.state = DecompressState::OpcodeLv1MoreDisp;
                 }
-                DecompressState::Opcode_lv1_moredisp => {
+                DecompressState::OpcodeLv1MoreDisp => {
                     self.matchdisp |= b as usize;
                     println!("matchdisp {}", self.matchdisp);
 
-                    println!("match disp -{} len {}", self.matchdisp + 1, self.matchlen);
-
-                    if self.matchdisp + 1 > self.lookback_avail {
-                        return Err(DecompressError::BadLookback {
-                            disp: self.matchdisp as u32,
-                            avail: self.lookback_avail as u32,
-                        });
-                    }
-
-                    for _ in 0..self.matchlen {
-                        let idx =
-                            (self.lookback_wptr + LOOKBACK_SZ - self.matchdisp - 1) % LOOKBACK_SZ;
-                        let copy_b = self.lookback[idx];
-                        outp(copy_b);
-                        self.lookback[self.lookback_wptr] = copy_b;
-                        self.lookback_wptr = (self.lookback_wptr + 1) % LOOKBACK_SZ;
-                        if self.lookback_avail < LOOKBACK_SZ {
-                            self.lookback_avail += 1;
-                        }
-                    }
-
-                    self.state = DecompressState::Opcode0_lv1;
+                    self.do_match(&mut outp)?;
+                    self.state = DecompressState::Opcode0Lv1;
                 }
-                DecompressState::Opcode0_lv2 => todo!(),
-                DecompressState::Opcode_lv2_morelen => todo!(),
-                DecompressState::Opcode_lv2_moredisp0 => todo!(),
-                DecompressState::Opcode_lv2_moredisp1 => todo!(),
-                DecompressState::Opcode_lv2_moredisp2 => todo!(),
-                DecompressState::LiteralRun_lv1(nlit) | DecompressState::LiteralRun_lv2(nlit) => {
+                DecompressState::Opcode0Lv2 => {
+                    let matchlen = (b >> 5) as usize + 2;
+                    let matchdisp = ((b & 0b11111) as usize) << 8;
+
+                    println!("matchlen {} matchdisp {}", matchlen, matchdisp);
+                    self.matchlen = matchlen;
+                    self.matchdisp = matchdisp;
+
+                    if matchlen == 0b000 + 2 {
+                        let nlit = (b & 0b11111) + 1;
+                        println!("lits: {}", nlit);
+                        self.state = DecompressState::LiteralRunLv2(nlit);
+                    } else if matchlen == 0b111 + 2 {
+                        self.state = DecompressState::OpcodeLv2MoreLen;
+                    } else {
+                        self.state = DecompressState::OpcodeLv2MoreDisp0;
+                    }
+                }
+                DecompressState::OpcodeLv2MoreLen => {
+                    self.matchlen += b as usize;
+                    println!("matchlen {}", self.matchlen);
+
+                    if b != 0xff {
+                        self.state = DecompressState::OpcodeLv2MoreDisp0;
+                    }
+                }
+                DecompressState::OpcodeLv2MoreDisp0 => {
+                    self.matchdisp |= b as usize;
+                    println!("matchdisp {}", self.matchdisp);
+
+                    if self.matchdisp == 0b11111_11111111 {
+                        self.state = DecompressState::OpcodeLv2MoreDisp1;
+                    } else {
+                        self.do_match(&mut outp)?;
+                        self.state = DecompressState::Opcode0Lv2;
+                    }
+                }
+                DecompressState::OpcodeLv2MoreDisp1 => {
+                    self.matchdisp += (b as usize) << 8;
+                    println!("matchdisp {}", self.matchdisp);
+                    self.state = DecompressState::OpcodeLv2MoreDisp2;
+                }
+                DecompressState::OpcodeLv2MoreDisp2 => {
+                    self.matchdisp += b as usize;
+                    println!("matchdisp {}", self.matchdisp);
+                    self.do_match(&mut outp)?;
+                    self.state = DecompressState::Opcode0Lv2;
+                }
+                DecompressState::LiteralRunLv1(nlit) | DecompressState::LiteralRunLv2(nlit) => {
                     outp(b);
                     self.lookback[self.lookback_wptr] = b;
                     self.lookback_wptr = (self.lookback_wptr + 1) % LOOKBACK_SZ;
@@ -188,18 +238,18 @@ impl DecompressStreaming {
                     }
 
                     match self.state {
-                        DecompressState::LiteralRun_lv1(_) => {
+                        DecompressState::LiteralRunLv1(_) => {
                             if nlit != 1 {
-                                self.state = DecompressState::LiteralRun_lv1(nlit - 1);
+                                self.state = DecompressState::LiteralRunLv1(nlit - 1);
                             } else {
-                                self.state = DecompressState::Opcode0_lv1;
+                                self.state = DecompressState::Opcode0Lv1;
                             }
                         }
-                        DecompressState::LiteralRun_lv2(_) => {
+                        DecompressState::LiteralRunLv2(_) => {
                             if nlit != 1 {
-                                self.state = DecompressState::LiteralRun_lv2(nlit - 1);
+                                self.state = DecompressState::LiteralRunLv2(nlit - 1);
                             } else {
-                                self.state = DecompressState::Opcode0_lv2;
+                                self.state = DecompressState::Opcode0Lv2;
                             }
                         }
                         _ => unreachable!(),
@@ -473,5 +523,79 @@ mod tests {
         }
 
         assert_eq!(out, vec![0; 256 * 1024]);
+    }
+
+    #[test]
+    fn flz_streaming_ref_decompress_2() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("tests/fastlz.lv2.bin");
+        let ref_fn = d.join("fastlztest/tool.c");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+        let ref_ = std::fs::read(ref_fn).unwrap();
+
+        let mut dec = DecompressStreaming::new_boxed();
+        let mut out = Vec::new();
+
+        for b in inp {
+            dec.decompress(&[b], |x| out.push(x)).unwrap();
+        }
+
+        let mut outp_f = BufWriter::new(File::create(d.join("dump.bin")).unwrap());
+        outp_f.write(&out).unwrap();
+
+        assert_eq!(out, ref_);
+    }
+
+    #[test]
+    fn flz_streaming_zeros_decompress_2() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("tests/fastlz-zeros.lv2.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut dec = DecompressStreaming::new_boxed();
+        let mut out = Vec::new();
+
+        for b in inp {
+            dec.decompress(&[b], |x| out.push(x)).unwrap();
+        }
+
+        assert_eq!(out, vec![0; 256 * 1024]);
+    }
+
+    #[test]
+    fn flz_streaming_long_disp_decompress_2() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("tests/fastlz2-longdisp.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut dec = DecompressStreaming::new_boxed();
+        let mut out = Vec::new();
+        let mut ref_ = vec![0; 16384];
+        ref_[0] = b'a';
+        ref_[1] = b'b';
+        ref_[2] = b'c';
+        ref_[3] = b'd';
+        ref_[4] = b'e';
+        ref_[5] = b'f';
+        ref_[6] = b'g';
+        ref_[0x3ff0 + 0] = b'a';
+        ref_[0x3ff0 + 1] = b'b';
+        ref_[0x3ff0 + 2] = b'c';
+        ref_[0x3ff0 + 3] = b'd';
+        ref_[0x3ff0 + 4] = b'e';
+        ref_[0x3ff0 + 5] = b'f';
+        ref_[0x3ff0 + 6] = b'g';
+
+        for b in inp {
+            dec.decompress(&[b], |x| out.push(x)).unwrap();
+        }
+
+        assert_eq!(out, ref_);
     }
 }
