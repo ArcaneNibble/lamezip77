@@ -20,7 +20,7 @@ int main(int argc, char **argv)
     assert(ret == inp_len);
     fclose(inf);
 
-    char *outp = malloc(inp_len * 10);
+    char *outp = malloc(inp_len * 1024);
 
     if (argv[1][0] == 'c')
     {
@@ -32,7 +32,7 @@ int main(int argc, char **argv)
     }
     else if (argv[1][0] == 'd')
     {
-        ret = fastlz_decompress(inp, inp_len, outp, inp_len * 10);
+        ret = fastlz_decompress(inp, inp_len, outp, inp_len * 1024);
     }
 
     FILE *outf = fopen(argv[3], "wb");

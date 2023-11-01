@@ -1,6 +1,6 @@
-use std::error::Error;
+use std::{error::Error, usize};
 
-use crate::util::*;
+use crate::{util::*, LZEngine, LZOutput, LZSettings};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DecompressState {
@@ -58,13 +58,13 @@ impl core::fmt::Display for DecompressError {
 
 impl Error for DecompressError {}
 
-// max size for level 2 (level 1 is smaller)
-const LOOKBACK_SZ: usize = 0xFFFF + 0x1FFF + 1;
+const LV1_LOOKBACK_SZ: usize = 0x1FFF + 1;
+const LV2_LOOKBACK_SZ: usize = 0xFFFF + 0x1FFF + 1;
 
 // technically copy-able, but don't want to make it easy to accidentally do so
 #[derive(Clone)]
 pub struct DecompressStreaming {
-    lookback: [u8; LOOKBACK_SZ],
+    lookback: [u8; LV2_LOOKBACK_SZ],
     lookback_wptr: usize,
     lookback_avail: usize,
     state: DecompressState,
@@ -75,7 +75,7 @@ pub struct DecompressStreaming {
 impl DecompressStreaming {
     pub fn new() -> Self {
         Self {
-            lookback: [0; LOOKBACK_SZ],
+            lookback: [0; LV2_LOOKBACK_SZ],
             lookback_wptr: 0,
             lookback_avail: 0,
             state: DecompressState::Opcode0Start,
@@ -88,7 +88,7 @@ impl DecompressStreaming {
             let layout = core::alloc::Layout::new::<Self>();
             let p = std::alloc::alloc(layout) as *mut Self;
             let p_lookback = core::ptr::addr_of_mut!((*p).lookback);
-            for i in 0..LOOKBACK_SZ {
+            for i in 0..LV2_LOOKBACK_SZ {
                 // my understanding is that this is safe because u64 doesn't have Drop
                 // and we don't construct a & anywhere
                 (*p_lookback)[i] = 0;
@@ -106,8 +106,6 @@ impl DecompressStreaming {
     where
         O: FnMut(u8),
     {
-        println!("match disp -{} len {}", self.matchdisp + 1, self.matchlen);
-
         if self.matchdisp + 1 > self.lookback_avail {
             return Err(DecompressError::BadLookback {
                 disp: self.matchdisp as u32,
@@ -116,12 +114,12 @@ impl DecompressStreaming {
         }
 
         for _ in 0..self.matchlen {
-            let idx = (self.lookback_wptr + LOOKBACK_SZ - self.matchdisp - 1) % LOOKBACK_SZ;
+            let idx = (self.lookback_wptr + LV2_LOOKBACK_SZ - self.matchdisp - 1) % LV2_LOOKBACK_SZ;
             let copy_b = self.lookback[idx];
             outp(copy_b);
             self.lookback[self.lookback_wptr] = copy_b;
-            self.lookback_wptr = (self.lookback_wptr + 1) % LOOKBACK_SZ;
-            if self.lookback_avail < LOOKBACK_SZ {
+            self.lookback_wptr = (self.lookback_wptr + 1) % LV2_LOOKBACK_SZ;
+            if self.lookback_avail < LV2_LOOKBACK_SZ {
                 self.lookback_avail += 1;
             }
         }
@@ -135,13 +133,10 @@ impl DecompressStreaming {
     {
         while inp.len() > 0 {
             let b = get_inp::<1>(&mut inp).unwrap()[0];
-            println!("state {:?} byte {:08b}", self.state, b);
-
             match self.state {
                 DecompressState::Opcode0Start => {
                     let level = b >> 5;
                     let nlit = (b & 0b11111) + 1;
-                    println!("lits: {}", nlit);
 
                     if level == 0 {
                         self.state = DecompressState::LiteralRunLv1(nlit);
@@ -155,13 +150,11 @@ impl DecompressStreaming {
                     let matchlen = (b >> 5) as usize + 2;
                     let matchdisp = ((b & 0b11111) as usize) << 8;
 
-                    println!("matchlen {} matchdisp {}", matchlen, matchdisp);
                     self.matchlen = matchlen;
                     self.matchdisp = matchdisp;
 
                     if matchlen == 0b000 + 2 {
                         let nlit = (b & 0b11111) + 1;
-                        println!("lits: {}", nlit);
                         self.state = DecompressState::LiteralRunLv1(nlit);
                     } else if matchlen == 0b111 + 2 {
                         self.state = DecompressState::OpcodeLv1MoreLen;
@@ -171,13 +164,10 @@ impl DecompressStreaming {
                 }
                 DecompressState::OpcodeLv1MoreLen => {
                     self.matchlen += b as usize;
-                    println!("matchlen {}", self.matchlen);
                     self.state = DecompressState::OpcodeLv1MoreDisp;
                 }
                 DecompressState::OpcodeLv1MoreDisp => {
                     self.matchdisp |= b as usize;
-                    println!("matchdisp {}", self.matchdisp);
-
                     self.do_match(&mut outp)?;
                     self.state = DecompressState::Opcode0Lv1;
                 }
@@ -185,13 +175,11 @@ impl DecompressStreaming {
                     let matchlen = (b >> 5) as usize + 2;
                     let matchdisp = ((b & 0b11111) as usize) << 8;
 
-                    println!("matchlen {} matchdisp {}", matchlen, matchdisp);
                     self.matchlen = matchlen;
                     self.matchdisp = matchdisp;
 
                     if matchlen == 0b000 + 2 {
                         let nlit = (b & 0b11111) + 1;
-                        println!("lits: {}", nlit);
                         self.state = DecompressState::LiteralRunLv2(nlit);
                     } else if matchlen == 0b111 + 2 {
                         self.state = DecompressState::OpcodeLv2MoreLen;
@@ -201,7 +189,6 @@ impl DecompressStreaming {
                 }
                 DecompressState::OpcodeLv2MoreLen => {
                     self.matchlen += b as usize;
-                    println!("matchlen {}", self.matchlen);
 
                     if b != 0xff {
                         self.state = DecompressState::OpcodeLv2MoreDisp0;
@@ -209,7 +196,6 @@ impl DecompressStreaming {
                 }
                 DecompressState::OpcodeLv2MoreDisp0 => {
                     self.matchdisp |= b as usize;
-                    println!("matchdisp {}", self.matchdisp);
 
                     if self.matchdisp == 0b11111_11111111 {
                         self.state = DecompressState::OpcodeLv2MoreDisp1;
@@ -220,20 +206,18 @@ impl DecompressStreaming {
                 }
                 DecompressState::OpcodeLv2MoreDisp1 => {
                     self.matchdisp += (b as usize) << 8;
-                    println!("matchdisp {}", self.matchdisp);
                     self.state = DecompressState::OpcodeLv2MoreDisp2;
                 }
                 DecompressState::OpcodeLv2MoreDisp2 => {
                     self.matchdisp += b as usize;
-                    println!("matchdisp {}", self.matchdisp);
                     self.do_match(&mut outp)?;
                     self.state = DecompressState::Opcode0Lv2;
                 }
                 DecompressState::LiteralRunLv1(nlit) | DecompressState::LiteralRunLv2(nlit) => {
                     outp(b);
                     self.lookback[self.lookback_wptr] = b;
-                    self.lookback_wptr = (self.lookback_wptr + 1) % LOOKBACK_SZ;
-                    if self.lookback_avail < LOOKBACK_SZ {
+                    self.lookback_wptr = (self.lookback_wptr + 1) % LV2_LOOKBACK_SZ;
+                    if self.lookback_avail < LV2_LOOKBACK_SZ {
                         self.lookback_avail += 1;
                     }
 
@@ -274,19 +258,15 @@ impl DecompressBuffered {
     where
         B: MaybeGrowableBuf,
     {
-        println!("decompress lv1");
-
         let mut first_opc = true;
 
         while inp.len() > 0 {
             let opc0 = get_inp::<1>(&mut inp).unwrap()[0];
-            println!("opc0 {:08b}", opc0);
 
             if first_opc || opc0 >> 5 == 0 {
                 first_opc = false;
                 // literal run
                 let nlit = (opc0 & 0b11111) + 1;
-                println!("lits: {}", nlit);
                 for _ in 0..nlit {
                     // XXX efficiency?
                     if outp.cur_pos() < outp.limit() {
@@ -300,16 +280,12 @@ impl DecompressBuffered {
                     ((opc0 >> 5) + 2) as usize
                 } else {
                     let opc1 = get_inp::<1>(&mut inp).map_err(|_| DecompressError::Truncated)?[0];
-                    println!("opc1 {}", opc1);
                     (opc1 as usize) + 9
                 };
 
                 let opc12 = get_inp::<1>(&mut inp).map_err(|_| DecompressError::Truncated)?[0];
-                println!("opc12 {}", opc12);
-
                 let matchdisp = (((opc0 as usize) & 0b11111) << 8) | (opc12 as usize);
 
-                println!("match disp -{} len {}", matchdisp + 1, matchlen);
                 outp.add_match(matchdisp + 1, matchlen).map_err(|_| {
                     DecompressError::BadLookback {
                         disp: matchdisp as u32,
@@ -326,19 +302,15 @@ impl DecompressBuffered {
     where
         B: MaybeGrowableBuf,
     {
-        println!("decompress lv1");
-
         let mut first_opc = true;
 
         while inp.len() > 0 {
             let opc0 = get_inp::<1>(&mut inp).unwrap()[0];
-            println!("opc0 {:08b}", opc0);
 
             if first_opc || opc0 >> 5 == 0 {
                 first_opc = false;
                 // literal run
                 let nlit = (opc0 & 0b11111) + 1;
-                println!("lits: {}", nlit);
                 for _ in 0..nlit {
                     // XXX efficiency?
                     if outp.cur_pos() < outp.limit() {
@@ -353,7 +325,6 @@ impl DecompressBuffered {
                     loop {
                         let morelen =
                             get_inp::<1>(&mut inp).map_err(|_| DecompressError::Truncated)?[0];
-                        println!("more len {}", morelen);
                         matchlen += morelen as usize;
                         if morelen != 0xff {
                             break;
@@ -363,19 +334,14 @@ impl DecompressBuffered {
 
                 let opc_dispnext =
                     get_inp::<1>(&mut inp).map_err(|_| DecompressError::Truncated)?[0];
-                println!("opc_dispnext {}", opc_dispnext);
-
                 let mut matchdisp = (((opc0 as usize) & 0b11111) << 8) | (opc_dispnext as usize);
                 if matchdisp == 0b11111_11111111 {
                     let moredisp =
                         get_inp::<2>(&mut inp).map_err(|_| DecompressError::Truncated)?;
-                    println!("more disp {:?}", moredisp);
                     let moredisp = ((moredisp[0] as usize) << 8) | (moredisp[1] as usize);
-                    println!("more disp {:?}", moredisp);
                     matchdisp += moredisp;
                 }
 
-                println!("match disp -{} len {}", matchdisp + 1, matchlen);
                 outp.add_match(matchdisp + 1, matchlen).map_err(|_| {
                     DecompressError::BadLookback {
                         disp: matchdisp as u32,
@@ -415,11 +381,254 @@ impl DecompressBuffered {
     }
 }
 
+pub struct CompressLevel1 {
+    engine: LZEngine<
+        LV1_LOOKBACK_SZ,
+        264,
+        { LV1_LOOKBACK_SZ + 264 },
+        3,
+        264,
+        13,
+        { 1 << 13 },
+        13,
+        { 1 << 13 },
+    >,
+    buffered_lits: [u8; 32],
+    num_buffered_lits: u8,
+}
+
+impl CompressLevel1 {
+    pub fn new() -> Self {
+        Self {
+            engine: LZEngine::new(),
+            buffered_lits: [0; 32],
+            num_buffered_lits: 0,
+        }
+    }
+    pub fn new_boxed() -> Box<Self> {
+        unsafe {
+            let layout = core::alloc::Layout::new::<Self>();
+            let p = std::alloc::alloc(layout) as *mut Self;
+            LZEngine::initialize_at(core::ptr::addr_of_mut!((*p).engine));
+            let p_buffered_lits = core::ptr::addr_of_mut!((*p).buffered_lits);
+            for i in 0..32 {
+                (*p_buffered_lits)[i] = 0;
+            }
+            (*p).num_buffered_lits = 0;
+            Box::from_raw(p)
+        }
+    }
+
+    pub fn compress<O>(&mut self, inp: &[u8], end_of_stream: bool, mut outp: O)
+    where
+        O: FnMut(u8),
+    {
+        let settings = LZSettings {
+            good_enough_search_len: 264,
+            max_len_to_insert_all_substr: u64::MAX,
+            max_prev_chain_follows: 1 << 13,
+            defer_output_match: true,
+            good_enough_defer_len: 64,
+            search_faster_defer_len: 128,
+            min_disp: 1,
+        };
+
+        macro_rules! dump_lits {
+            () => {
+                if self.num_buffered_lits > 0 {
+                    debug_assert!(self.num_buffered_lits <= 32);
+                    println!("literal run {}", self.num_buffered_lits);
+                    outp(self.num_buffered_lits - 1);
+                    for i in 0..self.num_buffered_lits {
+                        outp(self.buffered_lits[i as usize]);
+                    }
+                    self.num_buffered_lits = 0;
+                }
+            };
+        }
+
+        self.engine
+            .compress(&settings, inp, end_of_stream, |x| match x {
+                LZOutput::Lit(lit) => {
+                    self.buffered_lits[self.num_buffered_lits as usize] = lit;
+                    self.num_buffered_lits += 1;
+                    if self.num_buffered_lits == 32 {
+                        dump_lits!();
+                    }
+                }
+                LZOutput::Ref { disp, len } => {
+                    dump_lits!();
+
+                    println!("match {} {}", disp, len);
+
+                    let disp = disp - 1;
+                    debug_assert!(disp <= 0x1FFF);
+                    debug_assert!(len >= 3);
+
+                    let len_opc0 = if len >= 0b111 + 2 {
+                        0b111
+                    } else {
+                        (len - 2) as u8
+                    };
+
+                    let opc0 = (len_opc0 << 5) | (((disp >> 8) & 0b11111) as u8);
+                    outp(opc0);
+
+                    if len >= 0b111 + 2 {
+                        let len_opc1 = len - (0b111 + 2);
+                        debug_assert!(len_opc1 <= 0xff);
+                        outp(len_opc1 as u8);
+                    }
+
+                    outp((disp & 0xff) as u8);
+                }
+            });
+
+        if end_of_stream {
+            dump_lits!();
+        }
+    }
+}
+
+pub struct CompressLevel2 {
+    engine: LZEngine<
+        LV2_LOOKBACK_SZ,
+        512,
+        { LV2_LOOKBACK_SZ + 512 },
+        3,
+        { usize::MAX / 2 }, // XXX there are overflow issues
+        17,
+        { 1 << 17 },
+        17,
+        { 1 << 17 },
+    >,
+    buffered_lits: [u8; 32],
+    num_buffered_lits: u8,
+    tag_emitted: bool,
+}
+
+impl CompressLevel2 {
+    pub fn new() -> Self {
+        Self {
+            engine: LZEngine::new(),
+            buffered_lits: [0; 32],
+            num_buffered_lits: 0,
+            tag_emitted: false,
+        }
+    }
+    pub fn new_boxed() -> Box<Self> {
+        unsafe {
+            let layout = core::alloc::Layout::new::<Self>();
+            let p = std::alloc::alloc(layout) as *mut Self;
+            LZEngine::initialize_at(core::ptr::addr_of_mut!((*p).engine));
+            let p_buffered_lits = core::ptr::addr_of_mut!((*p).buffered_lits);
+            for i in 0..32 {
+                (*p_buffered_lits)[i] = 0;
+            }
+            (*p).num_buffered_lits = 0;
+            (*p).tag_emitted = false;
+            Box::from_raw(p)
+        }
+    }
+
+    pub fn compress<O>(&mut self, inp: &[u8], end_of_stream: bool, mut outp: O)
+    where
+        O: FnMut(u8),
+    {
+        let settings = LZSettings {
+            good_enough_search_len: u64::MAX,
+            max_len_to_insert_all_substr: u64::MAX,
+            max_prev_chain_follows: 1 << 17,
+            defer_output_match: true,
+            good_enough_defer_len: 8190,
+            search_faster_defer_len: 2048,
+            min_disp: 1,
+        };
+
+        macro_rules! dump_lits {
+            () => {
+                if self.num_buffered_lits > 0 {
+                    debug_assert!(self.num_buffered_lits <= 32);
+                    println!("literal run {}", self.num_buffered_lits);
+                    let tag = if !self.tag_emitted {
+                        self.tag_emitted = true;
+                        0b001_00000
+                    } else {
+                        0
+                    };
+                    outp(tag | (self.num_buffered_lits - 1));
+                    for i in 0..self.num_buffered_lits {
+                        outp(self.buffered_lits[i as usize]);
+                    }
+                    self.num_buffered_lits = 0;
+                }
+            };
+        }
+
+        self.engine
+            .compress(&settings, inp, end_of_stream, |x| match x {
+                LZOutput::Lit(lit) => {
+                    self.buffered_lits[self.num_buffered_lits as usize] = lit;
+                    self.num_buffered_lits += 1;
+                    if self.num_buffered_lits == 32 {
+                        dump_lits!();
+                    }
+                }
+                LZOutput::Ref { disp, len } => {
+                    dump_lits!();
+
+                    println!("match {} {}", disp, len);
+
+                    let disp = disp - 1;
+                    debug_assert!(disp <= 0x1FFF + 0xFFFF);
+                    debug_assert!(len >= 3);
+
+                    let disp_non_extra = core::cmp::min(0x1FFF, disp);
+                    let len_opc0 = if len >= 0b111 + 2 {
+                        0b111
+                    } else {
+                        (len - 2) as u8
+                    };
+
+                    let opc0 = (len_opc0 << 5) | (((disp_non_extra >> 8) & 0b11111) as u8);
+                    outp(opc0);
+
+                    // match len
+                    if len >= 0b111 + 2 {
+                        let mut remaining_len = len - (0b111 + 2);
+                        while remaining_len >= 0xFF {
+                            outp(0xFF);
+                            remaining_len -= 0xFF;
+                        }
+                        outp(remaining_len as u8);
+                    }
+
+                    // displacement
+                    outp((disp_non_extra & 0xff) as u8);
+
+                    // extra long displacement
+                    if disp >= 0x1FFF {
+                        let disp_extra = disp - disp_non_extra;
+                        println!("disp extra {}", disp_extra);
+                        debug_assert!(disp_extra <= 0xFFFF);
+                        outp(((disp_extra >> 8) & 0xff) as u8);
+                        outp((disp_extra & 0xff) as u8);
+                    }
+                }
+            });
+
+        if end_of_stream {
+            dump_lits!();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         fs::File,
         io::{BufWriter, Write},
+        process::Command,
     };
 
     use super::*;
@@ -597,5 +806,251 @@ mod tests {
         }
 
         assert_eq!(out, ref_);
+    }
+
+    #[test]
+    fn flz_lv1_roundtrip_bytewise() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("src/fastlz.rs");
+        let outp_fn = d.join("fastlz-lv1-roundtrip-bytewise.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut comp = CompressLevel1::new_boxed();
+        let mut compressed_out = Vec::new();
+        for i in 0..inp.len() {
+            comp.compress(&[inp[i]], false, |x| compressed_out.push(x));
+        }
+        comp.compress(&[], true, |x| compressed_out.push(x));
+
+        let mut outp_f = BufWriter::new(File::create(&outp_fn).unwrap());
+        outp_f.write(&compressed_out).unwrap();
+        drop(outp_f);
+
+        let dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(inp, decompress_ourselves);
+
+        let ref_fn = d.join("fastlz-lv1-roundtrip-bytewise.out");
+        Command::new("./fastlztest/tool")
+            .arg("d")
+            .arg(outp_fn.to_str().unwrap())
+            .arg(ref_fn.to_str().unwrap())
+            .status()
+            .unwrap();
+        let decompress_ref = std::fs::read(&ref_fn).unwrap();
+        assert_eq!(inp, decompress_ref);
+    }
+
+    #[test]
+    fn flz_lv1_roundtrip_wholefile() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("src/fastlz.rs");
+        let outp_fn = d.join("fastlz-lv1-roundtrip-wholefile.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut comp = CompressLevel1::new_boxed();
+        let mut compressed_out = Vec::new();
+        comp.compress(&inp, true, |x| compressed_out.push(x));
+
+        let mut outp_f = BufWriter::new(File::create(&outp_fn).unwrap());
+        outp_f.write(&compressed_out).unwrap();
+        drop(outp_f);
+
+        let dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(inp, decompress_ourselves);
+
+        let ref_fn = d.join("fastlz-lv1-roundtrip-wholefile.out");
+        Command::new("./fastlztest/tool")
+            .arg("d")
+            .arg(outp_fn.to_str().unwrap())
+            .arg(ref_fn.to_str().unwrap())
+            .status()
+            .unwrap();
+        let decompress_ref = std::fs::read(&ref_fn).unwrap();
+        assert_eq!(inp, decompress_ref);
+    }
+
+    #[test]
+    fn flz_lv2_roundtrip_bytewise() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("src/fastlz.rs");
+        let outp_fn = d.join("fastlz-lv2-roundtrip-bytewise.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut comp = CompressLevel2::new_boxed();
+        let mut compressed_out = Vec::new();
+        for i in 0..inp.len() {
+            comp.compress(&[inp[i]], false, |x| compressed_out.push(x));
+        }
+        comp.compress(&[], true, |x| compressed_out.push(x));
+
+        let mut outp_f = BufWriter::new(File::create(&outp_fn).unwrap());
+        outp_f.write(&compressed_out).unwrap();
+        drop(outp_f);
+
+        let dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(inp, decompress_ourselves);
+
+        let ref_fn = d.join("fastlz-lv2-roundtrip-bytewise.out");
+        Command::new("./fastlztest/tool")
+            .arg("d")
+            .arg(outp_fn.to_str().unwrap())
+            .arg(ref_fn.to_str().unwrap())
+            .status()
+            .unwrap();
+        let decompress_ref = std::fs::read(&ref_fn).unwrap();
+        assert_eq!(inp, decompress_ref);
+    }
+
+    #[test]
+    fn flz_lv2_roundtrip_wholefile() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("src/fastlz.rs");
+        let outp_fn = d.join("fastlz-lv2-roundtrip-wholefile.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut comp = CompressLevel2::new_boxed();
+        let mut compressed_out = Vec::new();
+        comp.compress(&inp, true, |x| compressed_out.push(x));
+
+        let mut outp_f = BufWriter::new(File::create(&outp_fn).unwrap());
+        outp_f.write(&compressed_out).unwrap();
+        drop(outp_f);
+
+        let dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(inp, decompress_ourselves);
+
+        let ref_fn = d.join("fastlz-lv2-roundtrip-wholefile.out");
+        Command::new("./fastlztest/tool")
+            .arg("d")
+            .arg(outp_fn.to_str().unwrap())
+            .arg(ref_fn.to_str().unwrap())
+            .status()
+            .unwrap();
+        let decompress_ref = std::fs::read(&ref_fn).unwrap();
+        assert_eq!(inp, decompress_ref);
+    }
+
+    #[test]
+    fn flz_lv2_roundtrip_longlen_bytewise() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let outp_fn = d.join("fastlz-lv2-roundtrip-longlen-bytewise.bin");
+
+        let inp = vec![0; 1024 * 32];
+
+        let mut comp = CompressLevel2::new_boxed();
+        let mut compressed_out = Vec::new();
+        for i in 0..inp.len() {
+            comp.compress(&[inp[i]], false, |x| compressed_out.push(x));
+        }
+        comp.compress(&[], true, |x| compressed_out.push(x));
+
+        let mut outp_f = BufWriter::new(File::create(&outp_fn).unwrap());
+        outp_f.write(&compressed_out).unwrap();
+        drop(outp_f);
+
+        let dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(inp, decompress_ourselves);
+
+        let ref_fn = d.join("fastlz-lv2-roundtrip-longlen-bytewise.out");
+        Command::new("./fastlztest/tool")
+            .arg("d")
+            .arg(outp_fn.to_str().unwrap())
+            .arg(ref_fn.to_str().unwrap())
+            .status()
+            .unwrap();
+        let decompress_ref = std::fs::read(&ref_fn).unwrap();
+        assert_eq!(inp, decompress_ref);
+    }
+
+    #[test]
+    fn flz_lv2_roundtrip_longlen_wholefile() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let outp_fn = d.join("fastlz-lv2-roundtrip-longlen-wholefile.bin");
+
+        let inp = vec![0; 1024 * 32];
+
+        let mut comp = CompressLevel2::new_boxed();
+        let mut compressed_out = Vec::new();
+        comp.compress(&inp, true, |x| compressed_out.push(x));
+
+        let mut outp_f = BufWriter::new(File::create(&outp_fn).unwrap());
+        outp_f.write(&compressed_out).unwrap();
+        drop(outp_f);
+
+        let dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(inp, decompress_ourselves);
+
+        let ref_fn = d.join("fastlz-lv2-roundtrip-longlen-wholefile.out");
+        Command::new("./fastlztest/tool")
+            .arg("d")
+            .arg(outp_fn.to_str().unwrap())
+            .arg(ref_fn.to_str().unwrap())
+            .status()
+            .unwrap();
+        let decompress_ref = std::fs::read(&ref_fn).unwrap();
+        assert_eq!(inp, decompress_ref);
+    }
+
+    #[test]
+    fn flz_lv2_roundtrip_longdisp_bytewise() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let outp_fn = d.join("fastlz-lv2-roundtrip-longdisp-bytewise.bin");
+        let mut inp = vec![0; 16384];
+        inp[0] = b'a';
+        inp[1] = b'b';
+        inp[2] = b'c';
+        inp[3] = b'd';
+        inp[4] = b'e';
+        inp[5] = b'f';
+        inp[6] = b'g';
+        inp[0x3ff0 + 0] = b'a';
+        inp[0x3ff0 + 1] = b'b';
+        inp[0x3ff0 + 2] = b'c';
+        inp[0x3ff0 + 3] = b'd';
+        inp[0x3ff0 + 4] = b'e';
+        inp[0x3ff0 + 5] = b'f';
+        inp[0x3ff0 + 6] = b'g';
+
+        let mut comp = CompressLevel2::new_boxed();
+        let mut compressed_out = Vec::new();
+        for i in 0..inp.len() {
+            comp.compress(&[inp[i]], false, |x| compressed_out.push(x));
+        }
+        comp.compress(&[], true, |x| compressed_out.push(x));
+
+        let mut outp_f = BufWriter::new(File::create(&outp_fn).unwrap());
+        outp_f.write(&compressed_out).unwrap();
+        drop(outp_f);
+
+        let dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(inp, decompress_ourselves);
+
+        let ref_fn = d.join("fastlz-lv2-roundtrip-longdisp-bytewise.out");
+        Command::new("./fastlztest/tool")
+            .arg("d")
+            .arg(outp_fn.to_str().unwrap())
+            .arg(ref_fn.to_str().unwrap())
+            .status()
+            .unwrap();
+        let decompress_ref = std::fs::read(&ref_fn).unwrap();
+        assert_eq!(inp, decompress_ref);
     }
 }
