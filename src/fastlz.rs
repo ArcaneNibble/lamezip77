@@ -533,13 +533,16 @@ impl CompressLevel2 {
     where
         O: FnMut(u8),
     {
+        // XXX tweak?
+        let good_enough_search_len = core::cmp::max(512, inp.len() as u64);
+
         let settings = LZSettings {
-            good_enough_search_len: u64::MAX,
+            good_enough_search_len,
             max_len_to_insert_all_substr: u64::MAX,
             max_prev_chain_follows: 1 << 17,
             defer_output_match: true,
-            good_enough_defer_len: 8190,
-            search_faster_defer_len: 2048,
+            good_enough_defer_len: 8190, // XXX tweak?
+            search_faster_defer_len: good_enough_search_len / 2,
             min_disp: 1,
             // for some reason, long matches cannot be any closer than -2 bytes from the end
             // this guarantees that condition is met
