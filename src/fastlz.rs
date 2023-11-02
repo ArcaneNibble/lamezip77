@@ -8,13 +8,13 @@ enum DecompressState {
     Opcode0Lv1,
     OpcodeLv1MoreLen,
     OpcodeLv1MoreDisp,
-    LiteralRunLv1(u8),
+    LiteralRunLv1,
     Opcode0Lv2,
     OpcodeLv2MoreLen,
     OpcodeLv2MoreDisp0,
     OpcodeLv2MoreDisp1,
     OpcodeLv2MoreDisp2,
-    LiteralRunLv2(u8),
+    LiteralRunLv2,
 }
 
 impl DecompressState {
@@ -68,6 +68,7 @@ pub struct DecompressStreaming {
     lookback_wptr: usize,
     lookback_avail: usize,
     state: DecompressState,
+    nlit: u8,
     matchlen: usize,
     matchdisp: usize,
 }
@@ -79,6 +80,7 @@ impl DecompressStreaming {
             lookback_wptr: 0,
             lookback_avail: 0,
             state: DecompressState::Opcode0Start,
+            nlit: 0,
             matchlen: 0,
             matchdisp: 0,
         }
@@ -96,6 +98,7 @@ impl DecompressStreaming {
             (*p).lookback_wptr = 0;
             (*p).lookback_avail = 0;
             (*p).state = DecompressState::Opcode0Start;
+            (*p).nlit = 0;
             (*p).matchlen = 0;
             (*p).matchdisp = 0;
             Box::from_raw(p)
@@ -138,10 +141,11 @@ impl DecompressStreaming {
                     let level = b >> 5;
                     let nlit = (b & 0b11111) + 1;
 
+                    self.nlit = nlit;
                     if level == 0 {
-                        self.state = DecompressState::LiteralRunLv1(nlit);
+                        self.state = DecompressState::LiteralRunLv1;
                     } else if level == 1 {
-                        self.state = DecompressState::LiteralRunLv2(nlit);
+                        self.state = DecompressState::LiteralRunLv2;
                     } else {
                         return Err(DecompressError::BadCompressionLevel(level));
                     }
@@ -154,8 +158,8 @@ impl DecompressStreaming {
                     self.matchdisp = matchdisp;
 
                     if matchlen == 0b000 + 2 {
-                        let nlit = (b & 0b11111) + 1;
-                        self.state = DecompressState::LiteralRunLv1(nlit);
+                        self.nlit = (b & 0b11111) + 1;
+                        self.state = DecompressState::LiteralRunLv1;
                     } else if matchlen == 0b111 + 2 {
                         self.state = DecompressState::OpcodeLv1MoreLen;
                     } else {
@@ -179,8 +183,8 @@ impl DecompressStreaming {
                     self.matchdisp = matchdisp;
 
                     if matchlen == 0b000 + 2 {
-                        let nlit = (b & 0b11111) + 1;
-                        self.state = DecompressState::LiteralRunLv2(nlit);
+                        self.nlit = (b & 0b11111) + 1;
+                        self.state = DecompressState::LiteralRunLv2;
                     } else if matchlen == 0b111 + 2 {
                         self.state = DecompressState::OpcodeLv2MoreLen;
                     } else {
@@ -213,7 +217,7 @@ impl DecompressStreaming {
                     self.do_match(&mut outp)?;
                     self.state = DecompressState::Opcode0Lv2;
                 }
-                DecompressState::LiteralRunLv1(nlit) | DecompressState::LiteralRunLv2(nlit) => {
+                DecompressState::LiteralRunLv1 | DecompressState::LiteralRunLv2 => {
                     outp(b);
                     self.lookback[self.lookback_wptr] = b;
                     self.lookback_wptr = (self.lookback_wptr + 1) % LV2_LOOKBACK_SZ;
@@ -221,22 +225,17 @@ impl DecompressStreaming {
                         self.lookback_avail += 1;
                     }
 
-                    match self.state {
-                        DecompressState::LiteralRunLv1(_) => {
-                            if nlit != 1 {
-                                self.state = DecompressState::LiteralRunLv1(nlit - 1);
-                            } else {
+                    self.nlit -= 1;
+                    if self.nlit == 0 {
+                        match self.state {
+                            DecompressState::LiteralRunLv1 => {
                                 self.state = DecompressState::Opcode0Lv1;
                             }
-                        }
-                        DecompressState::LiteralRunLv2(_) => {
-                            if nlit != 1 {
-                                self.state = DecompressState::LiteralRunLv2(nlit - 1);
-                            } else {
+                            DecompressState::LiteralRunLv2 => {
                                 self.state = DecompressState::Opcode0Lv2;
                             }
+                            _ => unreachable!(),
                         }
-                        _ => unreachable!(),
                     }
                 }
             }
