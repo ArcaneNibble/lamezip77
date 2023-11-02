@@ -308,6 +308,15 @@ impl Compress {
         }
     }
 
+    pub fn encode_header(&self, len: u32) -> [u8; 4] {
+        [
+            0x10,
+            (len & 0xFF) as u8,
+            ((len >> 8) & 0xFF) as u8,
+            ((len >> 16) & 0xFF) as u8,
+        ]
+    }
+
     pub fn compress<O>(&mut self, vram_mode: bool, inp: &[u8], end_of_stream: bool, mut outp: O)
     where
         O: FnMut(u8),
@@ -562,10 +571,7 @@ mod tests {
 
         let mut comp = Compress::new_boxed();
         let mut compressed_out = Vec::new();
-        compressed_out.push(0x10);
-        compressed_out.push(inp.len() as u8);
-        compressed_out.push((inp.len() >> 8) as u8);
-        compressed_out.push((inp.len() >> 16) as u8);
+        compressed_out.extend_from_slice(&comp.encode_header(inp.len() as u32));
         for i in 0..inp.len() {
             comp.compress(false, &[inp[i]], false, |x| compressed_out.push(x));
         }
