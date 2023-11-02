@@ -1,3 +1,4 @@
+use bitvec::prelude::*;
 use std::error::Error;
 
 use crate::{util::*, LZEngine, LZOutput, LZSettings};
@@ -132,11 +133,12 @@ impl DecompressStreaming {
 
             match self.state {
                 DecompressState::Token => {
-                    let nlit = b >> 4;
-                    let matchlen = b & 0xF;
+                    let token = b.view_bits::<Msb0>();
+                    let nlit = token[..4].load::<usize>();
+                    let matchlen = token[4..].load::<usize>();
 
-                    self.nlit = nlit as usize;
-                    self.matchlen = matchlen as usize + 4;
+                    self.nlit = nlit;
+                    self.matchlen = matchlen + 4;
 
                     if nlit == 15 {
                         self.state = DecompressState::MoreLitLen;
@@ -206,8 +208,9 @@ impl DecompressBuffered {
     {
         while inp.len() > 0 {
             let token = get_inp::<1>(&mut inp).unwrap()[0];
+            let token = token.view_bits::<Msb0>();
 
-            let mut nlits = (token >> 4) as usize;
+            let mut nlits = token[..4].load::<usize>();
             if nlits == 15 {
                 loop {
                     let b = get_inp::<1>(&mut inp).map_err(|_| DecompressError::Truncated)?[0];
@@ -232,10 +235,10 @@ impl DecompressBuffered {
                 break;
             }
 
-            let offset = get_inp::<2>(&mut inp).map_err(|_| DecompressError::Truncated)?;
-            let offset = (offset[0] as usize) | (((offset[1]) as usize) << 8);
+            let offset =
+                u16::from_le_bytes(get_inp::<2>(&mut inp).map_err(|_| DecompressError::Truncated)?);
 
-            let mut matchlen = (token & 0xF) as usize + 4;
+            let mut matchlen = token[4..].load::<usize>() + 4;
             if matchlen == 19 {
                 loop {
                     let b = get_inp::<1>(&mut inp).map_err(|_| DecompressError::Truncated)?[0];
@@ -253,11 +256,12 @@ impl DecompressBuffered {
                 });
             }
 
-            outp.add_match(offset, matchlen)
-                .map_err(|_| DecompressError::BadLookback {
+            outp.add_match(offset as usize, matchlen).map_err(|_| {
+                DecompressError::BadLookback {
                     disp: offset as u16,
                     avail: outp.cur_pos() as u16,
-                })?;
+                }
+            })?;
         }
         Ok(())
     }
@@ -342,7 +346,11 @@ impl<const MAX_LIT_BUF: usize> Compress<MAX_LIT_BUF> {
                     15
                 };
 
-                outp((nlit_lsb << 4) | (match_len_lsb as u8));
+                let mut token = 0u8;
+                let token_v = token.view_bits_mut::<Msb0>();
+                token_v[..4].store(nlit_lsb);
+                token_v[4..].store(match_len_lsb);
+                outp(token);
 
                 if self.num_buffered_lits >= 15 {
                     let mut nlit_left = self.num_buffered_lits - 15;
@@ -378,8 +386,9 @@ impl<const MAX_LIT_BUF: usize> Compress<MAX_LIT_BUF> {
 
                     debug_assert!(disp >= 1);
                     debug_assert!(disp <= 0xFFFF);
-                    outp((disp & 0xff) as u8);
-                    outp(((disp >> 8) & 0xff) as u8);
+                    let disp = (disp as u16).to_le_bytes();
+                    outp(disp[0]);
+                    outp(disp[1]);
 
                     if len >= 15 {
                         let mut len_left = len - 15;
