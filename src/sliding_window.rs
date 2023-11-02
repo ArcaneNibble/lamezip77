@@ -4,7 +4,7 @@
 // 3. all from stored, wraps around, none from inp (2 spans)
 // 4. part from stored, no wraparound, part from inp (2 spans)
 // 5. part from stored, wraps around, part from inp (3 spans)
-pub struct SpanSet<'a>(&'a [u8], Option<&'a [u8]>, Option<&'a [u8]>);
+pub struct SpanSet<'a>(&'a [u8], &'a [u8], &'a [u8]);
 
 impl<'a> core::ops::Index<usize> for SpanSet<'a> {
     type Output = u8;
@@ -14,12 +14,12 @@ impl<'a> core::ops::Index<usize> for SpanSet<'a> {
             &self.0[index]
         } else {
             let index = index - self.0.len();
-            let _1 = self.1.unwrap();
+            let _1 = self.1;
             if index < _1.len() {
                 &_1[index]
             } else {
                 let index = index - _1.len();
-                let _2 = self.2.unwrap();
+                let _2 = self.2;
                 &_2[index]
             }
         }
@@ -28,7 +28,7 @@ impl<'a> core::ops::Index<usize> for SpanSet<'a> {
 
 impl<'a> SpanSet<'a> {
     pub fn len(&self) -> usize {
-        self.0.len() + self.1.map_or(0, |x| x.len()) + self.2.map_or(0, |x| x.len())
+        self.0.len() + self.1.len() + self.2.len()
     }
 
     pub fn compare(&self, other: &Self) -> usize {
@@ -40,52 +40,40 @@ impl<'a> SpanSet<'a> {
         let mut b_which = 0;
 
         loop {
-            if a.len() == 0 {
+            while a.len() == 0 {
                 match a_which {
                     0 => {
-                        if self.1.is_none() {
-                            break;
-                        }
-                        a = self.1.unwrap();
+                        a = self.1;
                         a_which = 1;
                     }
                     1 => {
-                        if self.2.is_none() {
-                            break;
-                        }
-                        a = self.2.unwrap();
+                        a = self.2;
                         a_which = 2;
                     }
                     _ => break,
                 }
             }
-            if b.len() == 0 {
+            while b.len() == 0 {
                 match b_which {
                     0 => {
-                        if other.1.is_none() {
-                            break;
-                        }
-                        b = other.1.unwrap();
+                        b = other.1;
                         b_which = 1;
                     }
                     1 => {
-                        if other.2.is_none() {
-                            break;
-                        }
-                        b = other.2.unwrap();
+                        b = other.2;
                         b_which = 2;
                     }
                     _ => break,
                 }
             }
 
-            if a[0] == b[0] {
-                len += 1;
-                a = &a[1..];
-                b = &b[1..];
-            } else {
+            let matching = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+            if matching == 0 {
                 break;
             }
+            len += matching;
+            a = &a[matching..];
+            b = &b[matching..];
         }
 
         len
@@ -98,34 +86,34 @@ mod spanset_tests {
 
     #[test]
     fn span_set_compare() {
-        let a = SpanSet(&[1, 2, 3, 4, 5, 6, 7, 8], None, None);
+        let a = SpanSet(&[1, 2, 3, 4, 5, 6, 7, 8], &[], &[]);
 
-        let b = SpanSet(&[1, 2, 3, 4, 5, 6, 7], None, None);
+        let b = SpanSet(&[1, 2, 3, 4, 5, 6, 7], &[], &[]);
         assert_eq!(a.compare(&b), 7);
 
-        let b = SpanSet(&[1, 2, 3, 4, 5, 6, 7, 8, 9], None, None);
+        let b = SpanSet(&[1, 2, 3, 4, 5, 6, 7, 8, 9], &[], &[]);
         assert_eq!(a.compare(&b), 8);
 
-        let b = SpanSet(&[1, 2, 3, 4, 4, 6, 7], None, None);
+        let b = SpanSet(&[1, 2, 3, 4, 4, 6, 7], &[], &[]);
         assert_eq!(a.compare(&b), 4);
 
-        let b = SpanSet(&[1, 2, 3], Some(&[4, 5, 6, 7]), None);
+        let b = SpanSet(&[1, 2, 3], &[4, 5, 6, 7], &[]);
         assert_eq!(a.compare(&b), 7);
 
-        let b = SpanSet(&[1, 2, 3], Some(&[4, 5, 5, 7]), None);
+        let b = SpanSet(&[1, 2, 3], &[4, 5, 5, 7], &[]);
         assert_eq!(a.compare(&b), 5);
 
-        let b = SpanSet(&[1, 2, 3], Some(&[4]), Some(&[5, 6]));
+        let b = SpanSet(&[1, 2, 3], &[4], &[5, 6]);
         assert_eq!(a.compare(&b), 6);
 
-        let a = SpanSet(&[1, 2], Some(&[3, 4, 5, 6]), Some(&[7, 8]));
-        let b = SpanSet(&[1, 2, 3], Some(&[4, 5]), Some(&[6, 7, 8, 9]));
+        let a = SpanSet(&[1, 2], &[3, 4, 5, 6], &[7, 8]);
+        let b = SpanSet(&[1, 2, 3], &[4, 5], &[6, 7, 8, 9]);
         assert_eq!(a.compare(&b), 8);
     }
 
     #[test]
     fn span_index() {
-        let a = SpanSet(&[1, 2], Some(&[3, 4, 5, 6]), Some(&[7, 8]));
+        let a = SpanSet(&[1, 2], &[3, 4, 5, 6], &[7, 8]);
 
         for i in 0..8 {
             assert_eq!(a[i], (i + 1) as u8);
@@ -228,7 +216,7 @@ impl<'a, const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: 
 
         if dist_to_look_back == 0 && lookahead_valid_sz == 0 {
             // all from input
-            SpanSet(&self.inp[..dist_to_look_forward], None, None)
+            SpanSet(&self.inp[..dist_to_look_forward], &[], &[])
         } else {
             let (sz_from_internal_buf, sz_from_external_buf) =
                 if dist_to_look_forward <= lookahead_valid_sz {
@@ -245,9 +233,9 @@ impl<'a, const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: 
                     )
                 };
             let external_slice = if sz_from_external_buf != 0 {
-                Some(&self.inp[..sz_from_external_buf])
+                &self.inp[..sz_from_external_buf]
             } else {
-                None
+                &[]
             };
 
             let actual_rpos = (self.buf.rpos + TOT_BUF_SZ - dist_to_look_back) % TOT_BUF_SZ;
@@ -256,13 +244,13 @@ impl<'a, const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: 
                 SpanSet(
                     &self.buf.buf[actual_rpos..actual_rpos + sz_from_internal_buf],
                     external_slice,
-                    None,
+                    &[],
                 )
             } else {
                 // wraparound
                 SpanSet(
                     &self.buf.buf[actual_rpos..TOT_BUF_SZ],
-                    Some(&self.buf.buf[..actual_rpos + sz_from_internal_buf - TOT_BUF_SZ]),
+                    &self.buf.buf[..actual_rpos + sz_from_internal_buf - TOT_BUF_SZ],
                     external_slice,
                 )
             }
@@ -354,8 +342,8 @@ mod buffer_tests {
             let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
             let spans = win.get_next_spans(0, 4);
             assert_eq!(spans.0, [1, 2, 3, 4]);
-            assert_eq!(spans.1, None);
-            assert_eq!(spans.2, None)
+            assert_eq!(spans.1, []);
+            assert_eq!(spans.2, [])
         }
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
@@ -364,8 +352,8 @@ mod buffer_tests {
             let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
             let spans = win.get_next_spans(0, 4);
             assert_eq!(spans.0, [1, 2, 3, 4]);
-            assert_eq!(spans.1, None);
-            assert_eq!(spans.2, None)
+            assert_eq!(spans.1, []);
+            assert_eq!(spans.2, [])
         }
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
@@ -374,8 +362,8 @@ mod buffer_tests {
             let win = buf.add_inp(&[1, 2, 3, 4, 5, 6, 7, 8]);
             let spans = win.get_next_spans(0, 4);
             assert_eq!(spans.0, [1, 2, 3, 4]);
-            assert_eq!(spans.1, None);
-            assert_eq!(spans.2, None)
+            assert_eq!(spans.1, []);
+            assert_eq!(spans.2, [])
         }
     }
 
@@ -388,8 +376,8 @@ mod buffer_tests {
             let win = buf.add_inp(&[]);
             let spans = win.get_next_spans(0, 4);
             assert_eq!(spans.0, [1, 2, 3, 4]);
-            assert_eq!(spans.1, None);
-            assert_eq!(spans.2, None)
+            assert_eq!(spans.1, []);
+            assert_eq!(spans.2, [])
         }
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
@@ -399,8 +387,8 @@ mod buffer_tests {
             let win = buf.add_inp(&[]);
             let spans = win.get_next_spans(0, 4);
             assert_eq!(spans.0, [1, 2, 3, 4]);
-            assert_eq!(spans.1, None);
-            assert_eq!(spans.2, None)
+            assert_eq!(spans.1, []);
+            assert_eq!(spans.2, [])
         }
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
@@ -411,8 +399,8 @@ mod buffer_tests {
             let win = buf.add_inp(&[]);
             let spans = win.get_next_spans(0, 4);
             assert_eq!(spans.0, [1, 2, 3, 4]);
-            assert_eq!(spans.1, None);
-            assert_eq!(spans.2, None)
+            assert_eq!(spans.1, []);
+            assert_eq!(spans.2, [])
         }
     }
 
@@ -427,8 +415,8 @@ mod buffer_tests {
             let win = buf.add_inp(&[]);
             let spans = win.get_next_spans(0, 8);
             assert_eq!(spans.0, [1, 2, 3, 4]);
-            assert_eq!(spans.1, Some(&[5, 6, 7, 8][..]));
-            assert_eq!(spans.2, None)
+            assert_eq!(spans.1, [5, 6, 7, 8]);
+            assert_eq!(spans.2, [])
         }
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
@@ -439,8 +427,8 @@ mod buffer_tests {
             let win = buf.add_inp(&[]);
             let spans = win.get_next_spans(0, 8);
             assert_eq!(spans.0, [1]);
-            assert_eq!(spans.1, Some(&[2, 3, 4, 5, 6, 7, 8][..]));
-            assert_eq!(spans.2, None)
+            assert_eq!(spans.1, [2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!(spans.2, [])
         }
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
@@ -451,8 +439,8 @@ mod buffer_tests {
             let win = buf.add_inp(&[]);
             let spans = win.get_next_spans(0, 8);
             assert_eq!(spans.0, [1, 2, 3, 4, 5, 6, 7]);
-            assert_eq!(spans.1, Some(&[8][..]));
-            assert_eq!(spans.2, None)
+            assert_eq!(spans.1, [8]);
+            assert_eq!(spans.2, [])
         }
     }
 
@@ -465,8 +453,8 @@ mod buffer_tests {
             let win = buf.add_inp(&[4, 5, 6, 7, 8]);
             let spans = win.get_next_spans(0, 8);
             assert_eq!(spans.0, [1, 2, 3]);
-            assert_eq!(spans.1, Some(&[4, 5, 6, 7, 8][..]));
-            assert_eq!(spans.2, None)
+            assert_eq!(spans.1, [4, 5, 6, 7, 8]);
+            assert_eq!(spans.2, [])
         }
         {
             let mut buf: SlidingWindowBuf<1024, 256, { 1024 + 256 }> = SlidingWindowBuf::new();
@@ -476,8 +464,8 @@ mod buffer_tests {
             let win = buf.add_inp(&[6, 7, 8]);
             let spans = win.get_next_spans(0, 8);
             assert_eq!(spans.0, [1, 2, 3, 4, 5]);
-            assert_eq!(spans.1, Some(&[6, 7, 8][..]));
-            assert_eq!(spans.2, None)
+            assert_eq!(spans.1, [6, 7, 8]);
+            assert_eq!(spans.2, [])
         }
     }
 
@@ -491,8 +479,8 @@ mod buffer_tests {
         let win = buf.add_inp(&[6, 7, 8]);
         let spans = win.get_next_spans(0, 8);
         assert_eq!(spans.0, [1, 2, 3]);
-        assert_eq!(spans.1, Some(&[4, 5][..]));
-        assert_eq!(spans.2, Some(&[6, 7, 8][..]));
+        assert_eq!(spans.1, [4, 5]);
+        assert_eq!(spans.2, [6, 7, 8]);
     }
 
     #[test]
@@ -807,29 +795,29 @@ mod buffer_tests {
             // now we have 4 bytes in lookback, 4 bytes in lookahead, [8 9 10 11] not used yet
             let spans = win.get_next_spans(0, 4);
             assert_eq!(spans.0, [0, 1, 2, 3]);
-            assert_eq!(spans.1, None);
-            assert_eq!(spans.2, None);
+            assert_eq!(spans.1, []);
+            assert_eq!(spans.2, []);
             let spans = win.get_next_spans(1, 3);
             assert_eq!(spans.0, [1, 2, 3]);
-            assert_eq!(spans.1, None);
-            assert_eq!(spans.2, None);
+            assert_eq!(spans.1, []);
+            assert_eq!(spans.2, []);
             let spans = win.get_next_spans(3, 5);
             assert_eq!(spans.0, [3, 4, 5, 6, 7]);
-            assert_eq!(spans.1, None);
-            assert_eq!(spans.2, None);
+            assert_eq!(spans.1, []);
+            assert_eq!(spans.2, []);
             // oversize, clamped
             let spans = win.get_next_spans(0, 1000);
             assert_eq!(spans.0, [0, 1, 2, 3, 4, 5, 6, 7]);
-            assert_eq!(spans.1, Some(&[8, 9, 10, 11][..]));
-            assert_eq!(spans.2, None);
+            assert_eq!(spans.1, [8, 9, 10, 11]);
+            assert_eq!(spans.2, []);
             let spans = win.get_next_spans(3, 1000);
             assert_eq!(spans.0, [3, 4, 5, 6, 7]);
-            assert_eq!(spans.1, Some(&[8, 9, 10, 11][..]));
-            assert_eq!(spans.2, None);
+            assert_eq!(spans.1, [8, 9, 10, 11]);
+            assert_eq!(spans.2, []);
             let spans = win.get_next_spans(4, 1000);
             assert_eq!(spans.0, [4, 5, 6, 7]);
-            assert_eq!(spans.1, Some(&[8, 9, 10, 11][..]));
-            assert_eq!(spans.2, None);
+            assert_eq!(spans.1, [8, 9, 10, 11]);
+            assert_eq!(spans.2, []);
         }
         {
             // test having less than max lookbehind
@@ -838,20 +826,20 @@ mod buffer_tests {
             win.roll_window(3);
             let spans = win.get_next_spans(0, 1000);
             assert_eq!(spans.0, [0, 1, 2]);
-            assert_eq!(spans.1, None);
-            assert_eq!(spans.2, None);
+            assert_eq!(spans.1, []);
+            assert_eq!(spans.2, []);
             let spans = win.get_next_spans(1, 1000);
             assert_eq!(spans.0, [1, 2]);
-            assert_eq!(spans.1, None);
-            assert_eq!(spans.2, None);
+            assert_eq!(spans.1, []);
+            assert_eq!(spans.2, []);
             let spans = win.get_next_spans(2, 1000);
             assert_eq!(spans.0, [2]);
-            assert_eq!(spans.1, None);
-            assert_eq!(spans.2, None);
+            assert_eq!(spans.1, []);
+            assert_eq!(spans.2, []);
             let spans = win.get_next_spans(3, 1000);
             assert_eq!(spans.0, []);
-            assert_eq!(spans.1, None);
-            assert_eq!(spans.2, None);
+            assert_eq!(spans.1, []);
+            assert_eq!(spans.2, []);
         }
     }
 
@@ -865,27 +853,27 @@ mod buffer_tests {
         // seven bytes in lookback, zero in lookahead
         let spans = win.get_next_spans(1, 1000);
         assert_eq!(spans.0, [1, 2, 3, 4, 5, 6]);
-        assert_eq!(spans.1, None);
-        assert_eq!(spans.2, None);
+        assert_eq!(spans.1, []);
+        assert_eq!(spans.2, []);
         let spans = win.get_next_spans(5, 1000);
         assert_eq!(spans.0, [5, 6]);
-        assert_eq!(spans.1, None);
-        assert_eq!(spans.2, None);
+        assert_eq!(spans.1, []);
+        assert_eq!(spans.2, []);
         // full 8 bytes in lookback, 4 in lookahead, 3 in inp
         let mut win = buf.add_inp(&[7, 8, 9, 10, 11, 12, 13, 14]);
         win.roll_window(1);
         let spans = win.get_next_spans(1, 1000);
         assert_eq!(spans.0, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        assert_eq!(spans.1, Some(&[12, 13, 14][..]));
-        assert_eq!(spans.2, None);
+        assert_eq!(spans.1, [12, 13, 14]);
+        assert_eq!(spans.2, []);
         let spans = win.get_next_spans(5, 1000);
         assert_eq!(spans.0, [5, 6, 7, 8, 9, 10, 11]);
-        assert_eq!(spans.1, Some(&[12, 13, 14][..]));
-        assert_eq!(spans.2, None);
+        assert_eq!(spans.1, [12, 13, 14]);
+        assert_eq!(spans.2, []);
         let spans = win.get_next_spans(8, 1000);
         assert_eq!(spans.0, [8, 9, 10, 11]);
-        assert_eq!(spans.1, Some(&[12, 13, 14][..]));
-        assert_eq!(spans.2, None);
+        assert_eq!(spans.1, [12, 13, 14]);
+        assert_eq!(spans.2, []);
     }
 
     #[test]
@@ -896,21 +884,21 @@ mod buffer_tests {
         // 8 bytes in lookback, 4 in lookahead, 2 in inp
         let spans = win.get_next_spans(0, 1000);
         assert_eq!(spans.0, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        assert_eq!(spans.1, Some(&[12, 13][..]));
-        assert_eq!(spans.2, None);
+        assert_eq!(spans.1, [12, 13]);
+        assert_eq!(spans.2, []);
         win.roll_window(1);
         // lookback is still full with 8, 4 in lookahead, 1 in inp
         // min pos is now 1, and a wraparound happens
         let spans = win.get_next_spans(1, 1000);
         assert_eq!(spans.0, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        assert_eq!(spans.1, Some(&[12][..]));
-        assert_eq!(spans.2, Some(&[13][..]));
+        assert_eq!(spans.1, [12]);
+        assert_eq!(spans.2, [13]);
         win.roll_window(1);
         // lookback is still full with 8, 4 in lookahead, 0 in inp
         // min pos is now 2, and a wraparound happens
         let spans = win.get_next_spans(2, 1000);
         assert_eq!(spans.0, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        assert_eq!(spans.1, Some(&[12, 13][..]));
-        assert_eq!(spans.2, None);
+        assert_eq!(spans.1, [12, 13]);
+        assert_eq!(spans.2, []);
     }
 }
