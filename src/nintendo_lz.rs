@@ -1,3 +1,4 @@
+use bitvec::prelude::*;
 use std::error::Error;
 
 use crate::util::*;
@@ -149,7 +150,8 @@ impl DecompressStreaming {
                     self.state = DecompressState::BlockData0;
                 }
                 DecompressState::BlockData0 => {
-                    if self.block_flags & (1 << (7 - self.block_i)) == 0 {
+                    let flags = self.block_flags.view_bits::<Msb0>();
+                    if flags[self.block_i as usize] == false {
                         let lit = b;
                         outp(lit);
                         self.remaining_bytes -= 1;
@@ -169,8 +171,11 @@ impl DecompressStreaming {
                     }
                 }
                 DecompressState::BlockData1 => {
-                    let disp = (b as usize) | (((self.match_b0 & 0xF) as usize) << 8);
-                    let len = (self.match_b0 >> 4) as usize;
+                    let matchb = [self.match_b0, b];
+                    let matchb = matchb.view_bits::<Msb0>();
+
+                    let disp = matchb[4..].load_be::<usize>();
+                    let len = matchb[..4].load_be::<usize>();
 
                     if disp + 1 > self.lookback_avail {
                         return Err(DecompressError::BadLookback {
@@ -231,13 +236,14 @@ impl DecompressBuffered {
 
         while outp.cur_pos() < wanted_len {
             let flags = get_inp::<1>(&mut inp).map_err(|_| DecompressError::TooShort)?[0];
+            let flags = flags.view_bits::<Msb0>();
 
-            for i in (0..8).rev() {
+            for i in 0..8 {
                 if outp.cur_pos() == wanted_len {
                     break;
                 }
 
-                if flags & (1 << i) == 0 {
+                if flags[i] == false {
                     if inp.len() == 0 {
                         return Err(DecompressError::TooShort);
                     }
@@ -245,8 +251,9 @@ impl DecompressBuffered {
                     outp.add_lit(b);
                 } else {
                     let matchb = get_inp::<2>(&mut inp).map_err(|_| DecompressError::TooShort)?;
-                    let disp = (matchb[1] as usize) | (((matchb[0] & 0xF) as usize) << 8);
-                    let len = (matchb[0] >> 4) as usize;
+                    let matchb = matchb.view_bits::<Msb0>();
+                    let disp = matchb[4..].load_be::<usize>();
+                    let len = matchb[..4].load_be::<usize>();
 
                     let len = core::cmp::min(len + 3, wanted_len - outp.cur_pos());
 
@@ -339,7 +346,7 @@ impl Compress {
                     match self.buffered_out[i as usize] {
                         LZOutput::Lit(_) => {}
                         LZOutput::Ref { .. } => {
-                            flags |= 1 << (7 - i);
+                            flags.view_bits_mut::<Msb0>().set(i as usize, true);
                         }
                     }
                 }
@@ -359,8 +366,12 @@ impl Compress {
                             let disp = disp - 1;
                             let len = len - 3;
 
-                            outp(((disp >> 8) as u8) | ((len << 4) as u8));
-                            outp(disp as u8);
+                            let mut matchb = [0u8; 2];
+                            let matchb_v = matchb.view_bits_mut::<Msb0>();
+                            matchb_v[4..].store_be(disp);
+                            matchb_v[..4].store_be(len);
+                            outp(matchb[0]);
+                            outp(matchb[1]);
                         }
                     }
                 }
