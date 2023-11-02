@@ -129,7 +129,6 @@ impl DecompressStreaming {
     {
         while inp.len() > 0 {
             let b = get_inp::<1>(&mut inp).unwrap()[0];
-            println!("state {:?} byte {:02X}", self.state, b);
 
             match self.state {
                 DecompressState::Token => {
@@ -175,14 +174,14 @@ impl DecompressStreaming {
                     if self.matchlen == 19 {
                         self.state = DecompressState::MoreMatchLen
                     } else {
-                        self.do_match(&mut outp);
+                        self.do_match(&mut outp)?;
                         self.state = DecompressState::Token;
                     }
                 }
                 DecompressState::MoreMatchLen => {
                     self.matchlen += b as usize;
                     if b != 0xFF {
-                        self.do_match(&mut outp);
+                        self.do_match(&mut outp)?;
                         self.state = DecompressState::Token;
                     }
                 }
