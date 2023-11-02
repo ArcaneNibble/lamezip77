@@ -6,7 +6,7 @@ use std::{
     io::{BufWriter, Write},
 };
 
-use lamezip77::{fastlz, lz4, nintendo_lz};
+use lamezip77::{deflate, fastlz, lz4, nintendo_lz};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<OsString> = env::args_os().collect();
@@ -83,6 +83,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             Some("lz4") => {
                 let dec = lz4::DecompressBuffered::new();
+                outp = dec.decompress_new(&inp, usize::MAX)?;
+            }
+            Some("deflate") => {
+                let mut dec = deflate::DecompressBuffered::new();
                 outp = dec.decompress_new(&inp, usize::MAX)?;
             }
             _ => {
