@@ -72,8 +72,14 @@ impl<'a> SpanSet<'a> {
                 break;
             }
             len += matching;
-            a = &a[matching..];
-            b = &b[matching..];
+            // by definition, matching <= len of both
+            // but just to make sure
+            debug_assert!(matching <= a.len());
+            debug_assert!(matching <= b.len());
+            unsafe {
+                a = a.get_unchecked(matching..);
+                b = b.get_unchecked(matching..);
+            }
         }
 
         len
@@ -198,6 +204,15 @@ impl<'a, const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: 
         assert!(from_pos <= self.buf.rpos_real_offs);
         // assert!(from_pos >= self.buf.rpos_real_offs - LOOKBACK_SZ);
         assert!(from_pos + LOOKBACK_SZ as u64 >= self.buf.rpos_real_offs); // won't overflow when subtracting
+
+        let lookahead_valid_sz = self.buf.lookahead_valid_sz();
+
+        if from_pos == self.buf.rpos_real_offs && lookahead_valid_sz == 0 {
+            // all from input, bail early for optimization
+            let len = core::cmp::min(self.inp.len(), bytes);
+            return SpanSet(&self.inp[..len], &[], &[]);
+        }
+
         let dist_to_look_back = (self.buf.rpos_real_offs - from_pos) as usize; // <= LOOKBACK_SZ, >= 0
         let dist_to_look_forward = if bytes > dist_to_look_back {
             let tot_ahead_sz = self.tot_ahead_sz();
@@ -212,48 +227,50 @@ impl<'a, const LOOKBACK_SZ: usize, const LOOKAHEAD_SZ: usize, const TOT_BUF_SZ: 
             0
         };
 
-        let lookahead_valid_sz = self.buf.lookahead_valid_sz();
-
-        if dist_to_look_back == 0 && lookahead_valid_sz == 0 {
-            // all from input
-            SpanSet(&self.inp[..dist_to_look_forward], &[], &[])
-        } else {
-            let (sz_from_internal_buf, sz_from_external_buf) =
-                if dist_to_look_forward <= lookahead_valid_sz {
-                    (
-                        // always from the internal buf, but how much?
-                        // limited to bytes
-                        core::cmp::min(dist_to_look_back + dist_to_look_forward, bytes),
-                        0,
-                    )
-                } else {
-                    (
-                        dist_to_look_back + lookahead_valid_sz,
-                        dist_to_look_forward - lookahead_valid_sz,
-                    )
-                };
-            let external_slice = if sz_from_external_buf != 0 {
-                &self.inp[..sz_from_external_buf]
+        let (sz_from_internal_buf, sz_from_external_buf) =
+            if dist_to_look_forward <= lookahead_valid_sz {
+                (
+                    // always from the internal buf, but how much?
+                    // limited to bytes
+                    core::cmp::min(dist_to_look_back + dist_to_look_forward, bytes),
+                    0,
+                )
             } else {
-                &[]
+                (
+                    dist_to_look_back + lookahead_valid_sz,
+                    dist_to_look_forward - lookahead_valid_sz,
+                )
             };
+        let external_slice = if sz_from_external_buf != 0 {
+            debug_assert!(sz_from_external_buf <= self.inp.len());
+            unsafe { self.inp.get_unchecked(..sz_from_external_buf) }
+        } else {
+            &[]
+        };
 
-            let actual_rpos = (self.buf.rpos + TOT_BUF_SZ - dist_to_look_back) % TOT_BUF_SZ;
-            if actual_rpos + sz_from_internal_buf <= TOT_BUF_SZ {
-                // no wraparound
-                SpanSet(
-                    &self.buf.buf[actual_rpos..actual_rpos + sz_from_internal_buf],
-                    external_slice,
-                    &[],
-                )
-            } else {
-                // wraparound
-                SpanSet(
-                    &self.buf.buf[actual_rpos..TOT_BUF_SZ],
-                    &self.buf.buf[..actual_rpos + sz_from_internal_buf - TOT_BUF_SZ],
-                    external_slice,
-                )
-            }
+        let actual_rpos = (self.buf.rpos + TOT_BUF_SZ - dist_to_look_back) % TOT_BUF_SZ;
+        if actual_rpos + sz_from_internal_buf <= TOT_BUF_SZ {
+            // no wraparound
+            SpanSet(
+                unsafe {
+                    self.buf
+                        .buf
+                        .get_unchecked(actual_rpos..actual_rpos + sz_from_internal_buf)
+                },
+                external_slice,
+                &[],
+            )
+        } else {
+            // wraparound
+            SpanSet(
+                unsafe { self.buf.buf.get_unchecked(actual_rpos..TOT_BUF_SZ) },
+                unsafe {
+                    self.buf
+                        .buf
+                        .get_unchecked(..actual_rpos + sz_from_internal_buf - TOT_BUF_SZ)
+                },
+                external_slice,
+            )
         }
     }
 
