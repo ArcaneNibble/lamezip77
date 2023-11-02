@@ -358,14 +358,17 @@ impl Compress {
             };
         }
 
-        self.engine.compress(&settings, inp, end_of_stream, |x| {
-            self.buffered_out[self.num_buffered_out as usize] = x;
-            self.num_buffered_out += 1;
-            if self.num_buffered_out == 8 {
-                dump_buffered_out!();
-                self.num_buffered_out = 0;
-            }
-        });
+        self.engine
+            .compress::<_, ()>(&settings, inp, end_of_stream, |x| {
+                self.buffered_out[self.num_buffered_out as usize] = x;
+                self.num_buffered_out += 1;
+                if self.num_buffered_out == 8 {
+                    dump_buffered_out!();
+                    self.num_buffered_out = 0;
+                }
+                Ok(())
+            })
+            .unwrap();
 
         if end_of_stream && self.num_buffered_out > 0 {
             dump_buffered_out!();

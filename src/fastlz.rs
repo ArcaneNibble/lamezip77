@@ -447,39 +447,43 @@ impl CompressLevel1 {
         }
 
         self.engine
-            .compress(&settings, inp, end_of_stream, |x| match x {
-                LZOutput::Lit(lit) => {
-                    self.buffered_lits[self.num_buffered_lits as usize] = lit;
-                    self.num_buffered_lits += 1;
-                    if self.num_buffered_lits == 32 {
+            .compress::<_, ()>(&settings, inp, end_of_stream, |x| {
+                match x {
+                    LZOutput::Lit(lit) => {
+                        self.buffered_lits[self.num_buffered_lits as usize] = lit;
+                        self.num_buffered_lits += 1;
+                        if self.num_buffered_lits == 32 {
+                            dump_lits!();
+                        }
+                    }
+                    LZOutput::Ref { disp, len } => {
                         dump_lits!();
+
+                        let disp = disp - 1;
+                        debug_assert!(disp <= 0x1FFF);
+                        debug_assert!(len >= 3);
+
+                        let len_opc0 = if len >= 0b111 + 2 {
+                            0b111
+                        } else {
+                            (len - 2) as u8
+                        };
+
+                        let opc0 = (len_opc0 << 5) | (((disp >> 8) & 0b11111) as u8);
+                        outp(opc0);
+
+                        if len >= 0b111 + 2 {
+                            let len_opc1 = len - (0b111 + 2);
+                            debug_assert!(len_opc1 <= 0xff);
+                            outp(len_opc1 as u8);
+                        }
+
+                        outp((disp & 0xff) as u8);
                     }
                 }
-                LZOutput::Ref { disp, len } => {
-                    dump_lits!();
-
-                    let disp = disp - 1;
-                    debug_assert!(disp <= 0x1FFF);
-                    debug_assert!(len >= 3);
-
-                    let len_opc0 = if len >= 0b111 + 2 {
-                        0b111
-                    } else {
-                        (len - 2) as u8
-                    };
-
-                    let opc0 = (len_opc0 << 5) | (((disp >> 8) & 0b11111) as u8);
-                    outp(opc0);
-
-                    if len >= 0b111 + 2 {
-                        let len_opc1 = len - (0b111 + 2);
-                        debug_assert!(len_opc1 <= 0xff);
-                        outp(len_opc1 as u8);
-                    }
-
-                    outp((disp & 0xff) as u8);
-                }
-            });
+                Ok(())
+            })
+            .unwrap();
 
         if end_of_stream {
             dump_lits!();
@@ -568,53 +572,57 @@ impl CompressLevel2 {
         }
 
         self.engine
-            .compress(&settings, inp, end_of_stream, |x| match x {
-                LZOutput::Lit(lit) => {
-                    self.buffered_lits[self.num_buffered_lits as usize] = lit;
-                    self.num_buffered_lits += 1;
-                    if self.num_buffered_lits == 32 {
-                        dump_lits!();
-                    }
-                }
-                LZOutput::Ref { disp, len } => {
-                    dump_lits!();
-
-                    let disp = disp - 1;
-                    debug_assert!(disp <= 0x1FFF + 0xFFFF);
-                    debug_assert!(len >= 3);
-
-                    let disp_non_extra = core::cmp::min(0x1FFF, disp);
-                    let len_opc0 = if len >= 0b111 + 2 {
-                        0b111
-                    } else {
-                        (len - 2) as u8
-                    };
-
-                    let opc0 = (len_opc0 << 5) | (((disp_non_extra >> 8) & 0b11111) as u8);
-                    outp(opc0);
-
-                    // match len
-                    if len >= 0b111 + 2 {
-                        let mut remaining_len = len - (0b111 + 2);
-                        while remaining_len >= 0xFF {
-                            outp(0xFF);
-                            remaining_len -= 0xFF;
+            .compress::<_, ()>(&settings, inp, end_of_stream, |x| {
+                match x {
+                    LZOutput::Lit(lit) => {
+                        self.buffered_lits[self.num_buffered_lits as usize] = lit;
+                        self.num_buffered_lits += 1;
+                        if self.num_buffered_lits == 32 {
+                            dump_lits!();
                         }
-                        outp(remaining_len as u8);
                     }
+                    LZOutput::Ref { disp, len } => {
+                        dump_lits!();
 
-                    // displacement
-                    outp((disp_non_extra & 0xff) as u8);
+                        let disp = disp - 1;
+                        debug_assert!(disp <= 0x1FFF + 0xFFFF);
+                        debug_assert!(len >= 3);
 
-                    // extra long displacement
-                    if disp >= 0x1FFF {
-                        let disp_extra = disp - disp_non_extra;
-                        debug_assert!(disp_extra <= 0xFFFF);
-                        outp(((disp_extra >> 8) & 0xff) as u8);
-                        outp((disp_extra & 0xff) as u8);
+                        let disp_non_extra = core::cmp::min(0x1FFF, disp);
+                        let len_opc0 = if len >= 0b111 + 2 {
+                            0b111
+                        } else {
+                            (len - 2) as u8
+                        };
+
+                        let opc0 = (len_opc0 << 5) | (((disp_non_extra >> 8) & 0b11111) as u8);
+                        outp(opc0);
+
+                        // match len
+                        if len >= 0b111 + 2 {
+                            let mut remaining_len = len - (0b111 + 2);
+                            while remaining_len >= 0xFF {
+                                outp(0xFF);
+                                remaining_len -= 0xFF;
+                            }
+                            outp(remaining_len as u8);
+                        }
+
+                        // displacement
+                        outp((disp_non_extra & 0xff) as u8);
+
+                        // extra long displacement
+                        if disp >= 0x1FFF {
+                            let disp_extra = disp - disp_non_extra;
+                            debug_assert!(disp_extra <= 0xFFFF);
+                            outp(((disp_extra >> 8) & 0xff) as u8);
+                            outp((disp_extra & 0xff) as u8);
+                        }
                     }
                 }
-            });
+                Ok(())
+            })
+            .unwrap();
 
         if end_of_stream {
             dump_lits!();

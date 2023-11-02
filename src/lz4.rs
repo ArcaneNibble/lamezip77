@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use crate::util::*;
+use crate::{util::*, LZEngine, LZOutput, LZSettings};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DecompressState {
@@ -273,6 +273,135 @@ impl DecompressBuffered {
     }
 }
 
+pub struct Compress<const MAX_LIT_BUF: usize> {
+    engine: LZEngine<
+        LOOKBACK_SZ,
+        513,
+        { LOOKBACK_SZ + 513 },
+        4,
+        { usize::MAX / 2 }, // XXX there are overflow issues
+        16,
+        { 1 << 16 },
+        16,
+        { 1 << 16 },
+    >,
+    // we unfortunately will expand incompressible data more than the reference code
+    buffered_lits: [u8; MAX_LIT_BUF],
+    num_buffered_lits: usize,
+}
+
+impl<const MAX_LIT_BUF: usize> Compress<MAX_LIT_BUF> {
+    pub fn new() -> Self {
+        Self {
+            engine: LZEngine::new(),
+            buffered_lits: [0; MAX_LIT_BUF],
+            num_buffered_lits: 0,
+        }
+    }
+    pub fn new_boxed() -> Box<Self> {
+        unsafe {
+            let layout = core::alloc::Layout::new::<Self>();
+            let p = std::alloc::alloc(layout) as *mut Self;
+            LZEngine::initialize_at(core::ptr::addr_of_mut!((*p).engine));
+            let p_buffered_lits = core::ptr::addr_of_mut!((*p).buffered_lits);
+            for i in 0..MAX_LIT_BUF {
+                (*p_buffered_lits)[i] = 0;
+            }
+            (*p).num_buffered_lits = 0;
+            Box::from_raw(p)
+        }
+    }
+
+    pub fn compress<O>(&mut self, inp: &[u8], end_of_stream: bool, mut outp: O) -> Result<(), ()>
+    where
+        O: FnMut(u8),
+    {
+        // XXX tweak?
+        let good_enough_search_len = core::cmp::max(512, inp.len() as u64);
+
+        let settings = LZSettings {
+            good_enough_search_len,
+            max_len_to_insert_all_substr: u64::MAX,
+            max_prev_chain_follows: 1 << 16,
+            defer_output_match: true,
+            good_enough_defer_len: 525, // XXX tweak?
+            search_faster_defer_len: good_enough_search_len / 2,
+            min_disp: 1,
+            // last 5 *must* be literals (always)
+            // also, last match cannot be closer than 12 bytes from the end
+            // just hold out 12 bytes. not optimal, but simple
+            eos_holdout_bytes: 12,
+        };
+
+        macro_rules! dump_lits {
+            ($match_len:expr) => {
+                let match_len_lsb = if $match_len < 15 { $match_len } else { 15 };
+                let nlit_lsb = if self.num_buffered_lits < 15 {
+                    self.num_buffered_lits as u8
+                } else {
+                    15
+                };
+
+                outp((nlit_lsb << 4) | (match_len_lsb as u8));
+
+                if self.num_buffered_lits >= 15 {
+                    let mut nlit_left = self.num_buffered_lits - 15;
+                    while nlit_left >= 0xFF {
+                        outp(0xFF);
+                        nlit_left -= 0xFF;
+                    }
+                    outp(nlit_left as u8);
+                }
+
+                if self.num_buffered_lits > 0 {
+                    for i in 0..self.num_buffered_lits {
+                        outp(self.buffered_lits[i]);
+                    }
+                    self.num_buffered_lits = 0;
+                }
+            };
+        }
+
+        self.engine.compress(&settings, inp, end_of_stream, |x| {
+            match x {
+                LZOutput::Lit(lit) => {
+                    self.buffered_lits[self.num_buffered_lits as usize] = lit;
+                    self.num_buffered_lits += 1;
+                    if self.num_buffered_lits == MAX_LIT_BUF {
+                        return Err(());
+                    }
+                }
+                LZOutput::Ref { disp, len } => {
+                    debug_assert!(len >= 4);
+                    let len = len - 4;
+                    dump_lits!(len);
+
+                    debug_assert!(disp >= 1);
+                    debug_assert!(disp <= 0xFFFF);
+                    outp((disp & 0xff) as u8);
+                    outp(((disp >> 8) & 0xff) as u8);
+
+                    if len >= 15 {
+                        let mut len_left = len - 15;
+                        while len_left >= 0xFF {
+                            outp(0xFF);
+                            len_left -= 255;
+                        }
+                        outp(len_left as u8);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
+        if end_of_stream {
+            dump_lits!(0);
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -317,5 +446,160 @@ mod tests {
         }
 
         assert_eq!(out, ref_);
+    }
+
+    #[test]
+    fn lz4_roundtrip_zerobytes() {
+        let mut comp = Compress::<65536>::new_boxed();
+        let mut compressed_out = Vec::new();
+        comp.compress(&[], true, |x| compressed_out.push(x))
+            .unwrap();
+
+        assert_eq!(compressed_out, [0x00]);
+
+        let dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(decompress_ourselves, []);
+    }
+
+    #[test]
+    fn lz4_roundtrip_toosmall() {
+        let inp = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        let mut comp = Compress::<65536>::new_boxed();
+        let mut compressed_out = Vec::new();
+        comp.compress(&inp, true, |x| compressed_out.push(x))
+            .unwrap();
+
+        assert_eq!(compressed_out, [0xC0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        let dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(decompress_ourselves, inp);
+    }
+
+    #[test]
+    fn lz4_roundtrip_toosmall2() {
+        let inp = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12];
+
+        let mut comp = Compress::<65536>::new_boxed();
+        let mut compressed_out = Vec::new();
+        comp.compress(&inp, true, |x| compressed_out.push(x))
+            .unwrap();
+
+        assert_eq!(
+            compressed_out,
+            [0xD0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12]
+        );
+
+        let dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(decompress_ourselves, inp);
+    }
+
+    #[test]
+    fn lz4_min_compressible() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let outp_fn = d.join("lz4-min.bin");
+        let inp = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        let mut comp = Compress::<65536>::new_boxed();
+        let mut compressed_out = Vec::new();
+        comp.compress(&inp, true, |x| compressed_out.push(x))
+            .unwrap();
+
+        assert_eq!(
+            compressed_out,
+            [0x10, 0, 1, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+
+        let mut outp_f = BufWriter::new(File::create(&outp_fn).unwrap());
+        outp_f.write(&compressed_out).unwrap();
+        drop(outp_f);
+
+        let dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(decompress_ourselves, inp);
+
+        let ref_fn = d.join("lz4-min.out");
+        Command::new("./lz4test/tool")
+            .arg("d")
+            .arg(outp_fn.to_str().unwrap())
+            .arg(ref_fn.to_str().unwrap())
+            .status()
+            .unwrap();
+        let decompress_ref = std::fs::read(&ref_fn).unwrap();
+        assert_eq!(inp, decompress_ref);
+    }
+
+    #[test]
+    fn lz4_roundtrip_bytewise() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("src/lz4.rs");
+        let outp_fn = d.join("lz4-roundtrip-bytewise.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut comp = Compress::<65536>::new_boxed();
+        let mut compressed_out = Vec::new();
+        for i in 0..inp.len() {
+            comp.compress(&[inp[i]], false, |x| compressed_out.push(x))
+                .unwrap();
+        }
+        comp.compress(&[], true, |x| compressed_out.push(x))
+            .unwrap();
+
+        let mut outp_f = BufWriter::new(File::create(&outp_fn).unwrap());
+        outp_f.write(&compressed_out).unwrap();
+        drop(outp_f);
+
+        let dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(inp, decompress_ourselves);
+
+        let ref_fn = d.join("lz4-roundtrip-bytewise.out");
+        Command::new("./lz4test/tool")
+            .arg("d")
+            .arg(outp_fn.to_str().unwrap())
+            .arg(ref_fn.to_str().unwrap())
+            .status()
+            .unwrap();
+        let decompress_ref = std::fs::read(&ref_fn).unwrap();
+        assert_eq!(inp, decompress_ref);
+    }
+
+    #[test]
+    fn lz4_roundtrip_wholefile() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("src/lz4.rs");
+        let outp_fn = d.join("lz4-roundtrip-wholefile.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut comp = Compress::<65536>::new_boxed();
+        let mut compressed_out = Vec::new();
+        comp.compress(&inp, true, |x| compressed_out.push(x))
+            .unwrap();
+
+        let mut outp_f = BufWriter::new(File::create(&outp_fn).unwrap());
+        outp_f.write(&compressed_out).unwrap();
+        drop(outp_f);
+
+        let dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(inp, decompress_ourselves);
+
+        let ref_fn = d.join("lz4-roundtrip-wholefile.out");
+        Command::new("./lz4test/tool")
+            .arg("d")
+            .arg(outp_fn.to_str().unwrap())
+            .arg(ref_fn.to_str().unwrap())
+            .status()
+            .unwrap();
+        let decompress_ref = std::fs::read(&ref_fn).unwrap();
+        assert_eq!(inp, decompress_ref);
     }
 }
