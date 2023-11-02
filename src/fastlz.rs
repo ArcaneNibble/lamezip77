@@ -1,3 +1,4 @@
+use bitvec::prelude::*;
 use std::{error::Error, usize};
 
 use crate::{util::*, LZEngine, LZOutput, LZSettings};
@@ -138,8 +139,9 @@ impl DecompressStreaming {
             let b = get_inp::<1>(&mut inp).unwrap()[0];
             match self.state {
                 DecompressState::Opcode0Start => {
-                    let level = b >> 5;
-                    let nlit = (b & 0b11111) + 1;
+                    let b = b.view_bits::<Msb0>();
+                    let level = b[..3].load::<u8>();
+                    let nlit = b[3..].load::<u8>() + 1;
 
                     self.nlit = nlit;
                     if level == 0 {
@@ -151,14 +153,15 @@ impl DecompressStreaming {
                     }
                 }
                 DecompressState::Opcode0Lv1 => {
-                    let matchlen = (b >> 5) as usize + 2;
-                    let matchdisp = ((b & 0b11111) as usize) << 8;
+                    let b = b.view_bits::<Msb0>();
+                    let matchlen = b[..3].load::<usize>() + 2;
+                    let matchdisp = b[3..].load::<usize>() << 8;
 
                     self.matchlen = matchlen;
                     self.matchdisp = matchdisp;
 
                     if matchlen == 0b000 + 2 {
-                        self.nlit = (b & 0b11111) + 1;
+                        self.nlit = b[3..].load::<u8>() + 1;
                         self.state = DecompressState::LiteralRunLv1;
                     } else if matchlen == 0b111 + 2 {
                         self.state = DecompressState::OpcodeLv1MoreLen;
@@ -176,14 +179,15 @@ impl DecompressStreaming {
                     self.state = DecompressState::Opcode0Lv1;
                 }
                 DecompressState::Opcode0Lv2 => {
-                    let matchlen = (b >> 5) as usize + 2;
-                    let matchdisp = ((b & 0b11111) as usize) << 8;
+                    let b = b.view_bits::<Msb0>();
+                    let matchlen = b[..3].load::<usize>() + 2;
+                    let matchdisp = b[3..].load::<usize>() << 8;
 
                     self.matchlen = matchlen;
                     self.matchdisp = matchdisp;
 
                     if matchlen == 0b000 + 2 {
-                        self.nlit = (b & 0b11111) + 1;
+                        self.nlit = b[3..].load::<u8>() + 1;
                         self.state = DecompressState::LiteralRunLv2;
                     } else if matchlen == 0b111 + 2 {
                         self.state = DecompressState::OpcodeLv2MoreLen;
@@ -261,11 +265,13 @@ impl DecompressBuffered {
 
         while inp.len() > 0 {
             let opc0 = get_inp::<1>(&mut inp).unwrap()[0];
+            let opc0 = opc0.view_bits::<Msb0>();
+            let opc_len = opc0[..3].load::<u8>();
 
-            if first_opc || opc0 >> 5 == 0 {
+            if first_opc || opc_len == 0 {
                 first_opc = false;
                 // literal run
-                let nlit = (opc0 & 0b11111) + 1;
+                let nlit = opc0[3..].load::<u8>() + 1;
                 for _ in 0..nlit {
                     // XXX efficiency?
                     if outp.cur_pos() < outp.limit() {
@@ -275,15 +281,15 @@ impl DecompressBuffered {
                     }
                 }
             } else {
-                let matchlen = if (opc0 >> 5) != 0b111 {
-                    ((opc0 >> 5) + 2) as usize
+                let matchlen = if opc_len != 0b111 {
+                    (opc_len + 2) as usize
                 } else {
                     let opc1 = get_inp::<1>(&mut inp).map_err(|_| DecompressError::Truncated)?[0];
                     (opc1 as usize) + 9
                 };
 
                 let opc12 = get_inp::<1>(&mut inp).map_err(|_| DecompressError::Truncated)?[0];
-                let matchdisp = (((opc0 as usize) & 0b11111) << 8) | (opc12 as usize);
+                let matchdisp = (opc0[3..].load::<usize>() << 8) | (opc12 as usize);
 
                 outp.add_match(matchdisp + 1, matchlen).map_err(|_| {
                     DecompressError::BadLookback {
@@ -305,11 +311,13 @@ impl DecompressBuffered {
 
         while inp.len() > 0 {
             let opc0 = get_inp::<1>(&mut inp).unwrap()[0];
+            let opc0 = opc0.view_bits::<Msb0>();
+            let opc_len = opc0[..3].load::<u8>();
 
-            if first_opc || opc0 >> 5 == 0 {
+            if first_opc || opc_len == 0 {
                 first_opc = false;
                 // literal run
-                let nlit = (opc0 & 0b11111) + 1;
+                let nlit = opc0[3..].load::<u8>() + 1;
                 for _ in 0..nlit {
                     // XXX efficiency?
                     if outp.cur_pos() < outp.limit() {
@@ -319,7 +327,7 @@ impl DecompressBuffered {
                     }
                 }
             } else {
-                let mut matchlen = ((opc0 >> 5) + 2) as usize;
+                let mut matchlen = (opc_len + 2) as usize;
                 if matchlen == 0b111 + 2 {
                     loop {
                         let morelen =
@@ -333,7 +341,7 @@ impl DecompressBuffered {
 
                 let opc_dispnext =
                     get_inp::<1>(&mut inp).map_err(|_| DecompressError::Truncated)?[0];
-                let mut matchdisp = (((opc0 as usize) & 0b11111) << 8) | (opc_dispnext as usize);
+                let mut matchdisp = (opc0[3..].load::<usize>() << 8) | (opc_dispnext as usize);
                 if matchdisp == 0b11111_11111111 {
                     let moredisp =
                         get_inp::<2>(&mut inp).map_err(|_| DecompressError::Truncated)?;
@@ -469,7 +477,10 @@ impl CompressLevel1 {
                             (len - 2) as u8
                         };
 
-                        let opc0 = (len_opc0 << 5) | (((disp >> 8) & 0b11111) as u8);
+                        let mut opc0 = 0u8;
+                        let opc0_v = opc0.view_bits_mut::<Msb0>();
+                        opc0_v[..3].store(len_opc0);
+                        opc0_v[3..].store(disp >> 8);
                         outp(opc0);
 
                         if len >= 0b111 + 2 {
@@ -595,7 +606,10 @@ impl CompressLevel2 {
                             (len - 2) as u8
                         };
 
-                        let opc0 = (len_opc0 << 5) | (((disp_non_extra >> 8) & 0b11111) as u8);
+                        let mut opc0 = 0u8;
+                        let opc0_v = opc0.view_bits_mut::<Msb0>();
+                        opc0_v[..3].store(len_opc0);
+                        opc0_v[3..].store(disp_non_extra >> 8);
                         outp(opc0);
 
                         // match len
