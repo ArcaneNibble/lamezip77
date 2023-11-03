@@ -67,6 +67,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 })
                 .unwrap();
             }
+            Some("deflate") => {
+                let mut cmp = deflate::Compress::<32768>::new_boxed();
+                outp = Vec::new();
+                cmp.compress(&inp, true, |x| {
+                    outp.push(x);
+                });
+            }
             _ => {
                 println!("Invalid format {}", format.to_string_lossy());
                 return Ok(());

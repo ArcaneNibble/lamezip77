@@ -289,7 +289,7 @@ pub struct Compress<const MAX_LIT_BUF: usize> {
         16,
         { 1 << 16 },
     >,
-    // we unfortunately will expand incompressible data more than the reference code
+    // hard limit -- we FAIL if we encounter more than this number of incompressible literals
     buffered_lits: [u8; MAX_LIT_BUF],
     num_buffered_lits: usize,
 }

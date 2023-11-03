@@ -2,7 +2,7 @@ use std::error::Error;
 
 use bitvec::prelude::*;
 
-use crate::util::*;
+use crate::{util::*, LZEngine, LZOutput, LZSettings};
 
 const CODE_LEN_ALPHABET_SIZE: usize = 19;
 const CODE_LEN_ORDER: [u8; CODE_LEN_ALPHABET_SIZE] = [
@@ -76,6 +76,8 @@ impl core::fmt::Display for DecompressError {
 }
 
 impl Error for DecompressError {}
+
+const LOOKBACK_SZ: usize = 32768;
 
 #[inline]
 pub fn get_bits_num<T: funty::Integral, const N: usize>(
@@ -542,6 +544,169 @@ impl DecompressBuffered {
         let mut buf = VecBuf::new(0, max_sz);
         self.decompress(inp, &mut buf)?;
         Ok(buf.into())
+    }
+}
+
+struct CompressState<const HUFF_BUF_SZ: usize> {
+    huff_buf: [u16; HUFF_BUF_SZ],
+    huff_buf_count: usize,
+    pending_bits: u8,
+    pending_bits_count: usize,
+}
+
+impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
+    fn new() -> Self {
+        Self {
+            huff_buf: [0; HUFF_BUF_SZ],
+            huff_buf_count: 0,
+            pending_bits: 0,
+            pending_bits_count: 0,
+        }
+    }
+    unsafe fn initialize_at(p: *mut Self) {
+        let p_huff_buf = core::ptr::addr_of_mut!((*p).huff_buf);
+        for i in 0..HUFF_BUF_SZ {
+            (*p_huff_buf)[i] = 0;
+        }
+        (*p).huff_buf_count = 0;
+        (*p).pending_bits = 0;
+        (*p).pending_bits_count = 0;
+    }
+
+    fn outbits<O>(&mut self, mut bits: u16, nbits: usize, mut outp: O)
+    where
+        O: FnMut(u8),
+    {
+        if self.pending_bits_count > 0 {
+            println!(
+                "out bits: have {:0l1$b} adding {:0l2$b}",
+                self.pending_bits,
+                bits,
+                l1 = self.pending_bits_count,
+                l2 = nbits
+            );
+        } else {
+            println!("out bits: have nothing adding {:0l2$b}", bits, l2 = nbits);
+        }
+        debug_assert!(nbits <= 16);
+        bits = bits & ((1 << nbits) - 1);
+        let mut work = self.pending_bits as u32;
+        let work_v = work.view_bits_mut::<Lsb0>();
+        work_v[self.pending_bits_count..self.pending_bits_count + nbits].store_le(bits);
+
+        let mut totbits = self.pending_bits_count + nbits;
+        while totbits >= 8 {
+            println!("out bits: {:02X}", (work & 0xff));
+            outp((work & 0xff) as u8);
+            work >>= 8;
+            totbits -= 8;
+        }
+        self.pending_bits = (work & 0xff) as u8;
+        self.pending_bits_count = totbits;
+        println!(
+            "out bits: now {:0l1$b}",
+            self.pending_bits,
+            l1 = self.pending_bits_count,
+        );
+    }
+
+    fn do_huff_buf<O>(&mut self, is_final: bool, mut outp: O)
+    where
+        O: FnMut(u8),
+    {
+        println!("huff buf count {}", self.huff_buf_count);
+        self.outbits(is_final as u16, 1, &mut outp);
+        if self.huff_buf_count == 0 {
+            self.outbits(0b00, 2, &mut outp);
+            if self.pending_bits_count > 0 {
+                println!(
+                    "dump final {} bits {:0l$b}",
+                    self.pending_bits_count,
+                    self.pending_bits,
+                    l = self.pending_bits_count
+                );
+                outp(self.pending_bits);
+            }
+            // len, nlen
+            outp(0x00);
+            outp(0x00);
+            outp(0xff);
+            outp(0xff);
+        } else {
+            todo!()
+        }
+    }
+}
+
+pub struct Compress<const HUFF_BUF_SZ: usize> {
+    engine:
+        LZEngine<LOOKBACK_SZ, 258, { LOOKBACK_SZ + 258 }, 3, 258, 15, { 1 << 15 }, 15, { 1 << 15 }>,
+    state: CompressState<HUFF_BUF_SZ>,
+}
+
+impl<const HUFF_BUF_SZ: usize> Compress<HUFF_BUF_SZ> {
+    pub fn new() -> Self {
+        Self {
+            engine: LZEngine::new(),
+            state: CompressState::new(),
+        }
+    }
+    pub fn new_boxed() -> Box<Self> {
+        unsafe {
+            let layout = core::alloc::Layout::new::<Self>();
+            let p = std::alloc::alloc(layout) as *mut Self;
+            LZEngine::initialize_at(core::ptr::addr_of_mut!((*p).engine));
+            CompressState::initialize_at(core::ptr::addr_of_mut!((*p).state));
+            Box::from_raw(p)
+        }
+    }
+
+    pub fn compress<O>(&mut self, inp: &[u8], end_of_stream: bool, mut outp: O)
+    where
+        O: FnMut(u8),
+    {
+        let settings = LZSettings {
+            good_enough_search_len: 258,
+            max_len_to_insert_all_substr: u64::MAX,
+            max_prev_chain_follows: 4096, // copy zlib/gzip level 9
+            defer_output_match: true,
+            good_enough_defer_len: 258,
+            search_faster_defer_len: 32, // copy zlib/gzip level 9
+            min_disp: 1,
+            eos_holdout_bytes: 0,
+        };
+
+        let s = &mut self.state;
+
+        self.engine
+            .compress::<_, ()>(&settings, inp, end_of_stream, |x| match x {
+                LZOutput::Lit(lit) => {
+                    if s.huff_buf_count == HUFF_BUF_SZ {
+                        s.do_huff_buf(false, &mut outp);
+                    }
+                    s.huff_buf[s.huff_buf_count] = lit as u16;
+                    s.huff_buf_count += 1;
+                    Ok(())
+                }
+                LZOutput::Ref { disp, len } => {
+                    debug_assert!(disp >= 1);
+                    debug_assert!(disp <= 32768);
+                    debug_assert!(len >= 3);
+                    debug_assert!(len <= 258);
+                    if s.huff_buf_count >= HUFF_BUF_SZ - 1 {
+                        s.do_huff_buf(false, &mut outp);
+                    }
+                    s.huff_buf[s.huff_buf_count] = (len as u16) | 0x8000;
+                    s.huff_buf[s.huff_buf_count + 1] = (disp - 1) as u16;
+                    s.huff_buf_count += 2;
+                    Ok(())
+                }
+            })
+            .unwrap();
+
+        if end_of_stream {
+            s.do_huff_buf(true, &mut outp);
+        }
     }
 }
 
