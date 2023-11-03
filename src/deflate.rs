@@ -33,7 +33,7 @@ pub enum DecompressError {
     InvalidHuffNoSyms,
     InvalidCodeLenRep,
     BadNLen { len: u16, nlen: u16 },
-    BadHuffLit,
+    BadHuffSym,
     Truncated,
 }
 
@@ -65,8 +65,8 @@ impl core::fmt::Display for DecompressError {
             DecompressError::BadNLen { len, nlen } => {
                 write!(f, "Bad LEN/NLEN ({:04X}/{:04X})", len, nlen)
             }
-            DecompressError::BadHuffLit => {
-                write!(f, "An invalid value was encoded for a literal/length")
+            DecompressError::BadHuffSym => {
+                write!(f, "An invalid symbol was encoded")
             }
             DecompressError::Truncated => {
                 write!(f, "Input is truncated")
@@ -77,6 +77,7 @@ impl core::fmt::Display for DecompressError {
 
 impl Error for DecompressError {}
 
+#[inline]
 pub fn get_bits_num<T: funty::Integral, const N: usize>(
     inp: &mut &BitSlice<u8>,
 ) -> Result<T, DecompressError> {
@@ -89,6 +90,7 @@ pub fn get_bits_num<T: funty::Integral, const N: usize>(
     }
 }
 
+#[inline]
 pub fn get_bits_num_dyn<T: funty::Integral>(
     inp: &mut &BitSlice<u8>,
     n: usize,
@@ -103,6 +105,7 @@ pub fn get_bits_num_dyn<T: funty::Integral>(
     }
 }
 
+#[inline]
 pub fn get_bits_slice<'a>(
     inp: &mut &'a BitSlice<u8>,
     n: usize,
@@ -137,7 +140,6 @@ impl<
     > CanonicalHuffmanDecoder<SymTy, ALPHABET_SZ, MAX_LEN, MAX_LEN_PLUS_ONE, TWO_POW_MAX_LEN>
 {
     pub fn init(&mut self, code_lens: &[u8]) -> Result<(), DecompressError> {
-        println!("~~~~~ new huffman setup ~~~~~");
         assert!(MAX_LEN < 16); // hard limit good enough for deflate
         assert!(1 << MAX_LEN == TWO_POW_MAX_LEN);
         assert!(MAX_LEN + 1 == MAX_LEN_PLUS_ONE);
@@ -156,12 +158,10 @@ impl<
                 codes_at_bit_count[l as usize] += 1;
             }
         }
-        println!("shortest code is {}", min_code_len);
         if min_code_len == u8::MAX {
             return Err(DecompressError::InvalidHuffNoSyms);
         }
         self.min_code_len = min_code_len as usize;
-        println!("# codes at each bit count {:?}", codes_at_bit_count);
 
         let mut next_code_at_bit_count = [0u16; MAX_LEN_PLUS_ONE];
         let mut code = 0;
@@ -169,7 +169,6 @@ impl<
             code = (code + codes_at_bit_count[i - 1]) << 1;
             next_code_at_bit_count[i] = code;
         }
-        println!("next codes at each bit count {:x?}", next_code_at_bit_count);
 
         for sym in 0..ALPHABET_SZ {
             let l = if sym < code_lens.len() {
@@ -179,42 +178,34 @@ impl<
             };
             if l > 0 {
                 let code = next_code_at_bit_count[l];
-                println!("code for {} is {:0l$b}", sym, code, l = l);
                 debug_assert!(l <= MAX_LEN);
                 let code = code << (MAX_LEN - l);
-                // println!("new code {:0l$b}", code, l = MAX_LEN);
                 debug_assert!(self.lookup[code as usize] == SymTy::default());
                 self.lookup[code as usize] = (sym, l as u8).into();
                 next_code_at_bit_count[l] += 1;
             }
         }
-        // println!("code lookup table {:?}", self.lookup);
 
         Ok(())
     }
 
     pub fn read_sym(&self, inp: &mut &BitSlice<u8>) -> Result<SymTy, DecompressError> {
         let min_code = get_bits_slice(inp, self.min_code_len)?;
-        println!("min code {:?}", min_code);
         let mut cur_code = 0u16;
         let cur_code_v = cur_code.view_bits_mut::<Msb0>();
         cur_code_v[(16 - MAX_LEN)..(16 - MAX_LEN + self.min_code_len)]
             .clone_from_bitslice(&min_code);
         let mut cur_code_len = self.min_code_len;
-        println!("cur code {:016b} len {}", cur_code, cur_code_len);
-        println!("asdf {:?}", self.lookup[cur_code as usize]);
 
         while self.lookup[cur_code as usize] == SymTy::default()
             || self.lookup[cur_code as usize].nbits() as usize != cur_code_len
         {
             let nextbit: u8 = get_bits_num::<u8, 1>(inp)?;
-            println!("need more, {}", nextbit);
             let cur_code_v = cur_code.view_bits_mut::<Msb0>();
             cur_code_v.set(16 - MAX_LEN + cur_code_len, nextbit != 0);
             cur_code_len += 1;
         }
 
-        println!("full code {:016b}", cur_code);
         let sym = self.lookup[cur_code as usize];
         debug_assert!(sym != SymTy::default());
         Ok(sym)
@@ -378,20 +369,16 @@ impl DecompressBuffered {
         loop {
             let bfinal = get_bits_num::<u8, 1>(&mut inp)?;
             let btype = get_bits_num::<u8, 2>(&mut inp)?;
-            println!("btype {} bfinal {}", btype, bfinal);
 
             if btype == 3 {
                 return Err(DecompressError::InvalidBlockType);
             } else if btype == 0 {
-                println!("stored block");
                 let leftover_bits = inp.len() % 8;
-                println!("dropping {} bits", leftover_bits);
                 let _ = get_bits_slice(&mut inp, leftover_bits);
 
                 // xxx efficiency???
                 let len = get_bits_num::<u16, 16>(&mut inp)?;
                 let nlen = get_bits_num::<u16, 16>(&mut inp)?;
-                println!("len {} nlen {}", len, nlen);
                 if len != !nlen {
                     return Err(DecompressError::BadNLen { len, nlen });
                 }
@@ -405,7 +392,6 @@ impl DecompressBuffered {
                 self.dist_decoder.reset();
 
                 if btype == 1 {
-                    println!("fixed huff");
                     let mut lit_lens = [0; 288];
                     for i in 0..=143 {
                         lit_lens[i] = 8;
@@ -422,11 +408,9 @@ impl DecompressBuffered {
                     self.lit_decoder.init(&lit_lens).unwrap();
                     self.dist_decoder.init(&[5; 30]).unwrap();
                 } else {
-                    println!("dynamic huff");
                     let hlit = get_bits_num::<u16, 5>(&mut inp)? + 257;
                     let hdist = get_bits_num::<u8, 5>(&mut inp)? + 1;
                     let hclen = get_bits_num::<u8, 4>(&mut inp)? + 4;
-                    println!("hlit {} hdist {} hclen {}", hlit, hdist, hclen);
                     if hlit > 286 {
                         return Err(DecompressError::InvalidHLit);
                     }
@@ -438,10 +422,8 @@ impl DecompressBuffered {
                     for i in 0..hclen {
                         let l = get_bits_num::<u8, 3>(&mut inp)?;
                         let idx = CODE_LEN_ORDER[i as usize];
-                        println!("code len sym {} bits {}", idx, l);
                         code_len_lens[idx as usize] = l;
                     }
-                    println!("all code len lens: {:?}", code_len_lens);
 
                     self.coded_lengths_decoder.init(&code_len_lens)?;
 
@@ -449,11 +431,9 @@ impl DecompressBuffered {
                     let mut actual_huff_code_i = 0;
                     while actual_huff_code_i < (hlit + hdist as u16) as usize {
                         let code_len_sym = self.coded_lengths_decoder.read_sym(&mut inp)?.into();
-                        println!("code length sym {}", code_len_sym);
 
                         match code_len_sym {
                             0..=15 => {
-                                println!("outputting {}", code_len_sym);
                                 actual_huff_code_lens[actual_huff_code_i] = code_len_sym as u8;
                                 actual_huff_code_i += 1;
                             }
@@ -463,7 +443,6 @@ impl DecompressBuffered {
                                     return Err(DecompressError::InvalidCodeLenRep);
                                 }
                                 let to_rep = actual_huff_code_lens[actual_huff_code_i - 1];
-                                println!("repeating {} {} times", to_rep, rep);
                                 if actual_huff_code_i + rep as usize
                                     > (hlit + hdist as u16) as usize
                                 {
@@ -477,12 +456,10 @@ impl DecompressBuffered {
                             }
                             17 => {
                                 let rep = get_bits_num::<u8, 3>(&mut inp)? + 3;
-                                println!("outputting {} 0s", rep);
                                 actual_huff_code_i += rep as usize;
                             }
                             18 => {
                                 let rep = get_bits_num::<u8, 7>(&mut inp)? + 11;
-                                println!("outputting {} 0s", rep);
                                 actual_huff_code_i += rep as usize;
                             }
                             _ => unreachable!(),
@@ -490,7 +467,6 @@ impl DecompressBuffered {
                     }
 
                     if actual_huff_code_i != (hlit + hdist as u16) as usize {
-                        println!("outputted too many lengths");
                         return Err(DecompressError::InvalidCodeLenRep);
                     }
 
@@ -498,23 +474,14 @@ impl DecompressBuffered {
                         actual_huff_code_lens.split_at(hlit as usize);
                     let dist_code_lens = &dist_code_lens[..hdist as usize];
 
-                    println!("literal code lengths {:?}", literal_code_lens);
-                    println!("distance code lengths {:?}", dist_code_lens);
-
                     self.lit_decoder.init(literal_code_lens)?;
                     if !(hdist == 1 && dist_code_lens[0] == 0) {
                         self.dist_decoder.init(dist_code_lens)?;
-                    } else {
-                        println!("no dists used");
                     }
                 }
 
-                println!("doing huff");
-
                 loop {
                     let litsym: usize = self.lit_decoder.read_sym(&mut inp)?.into();
-                    println!("lit sym {:03X}", litsym);
-
                     match litsym {
                         0..=0xff => {
                             outp.add_lit(litsym as u8);
@@ -527,11 +494,11 @@ impl DecompressBuffered {
                                 0
                             };
                             let len = LEN_FOR_SYM[litsym - 257] + len_extra;
-                            println!("len {}", len);
 
                             let distsym: usize = self.dist_decoder.read_sym(&mut inp)?.into();
-                            println!("dist sym {}", distsym);
-                            debug_assert!(distsym <= 29);
+                            if distsym > 29 {
+                                return Err(DecompressError::BadHuffSym);
+                            }
                             let dist_extra_nbits = DIST_EXTRA_BITS[distsym];
                             let dist_extra = if dist_extra_nbits > 0 {
                                 get_bits_num_dyn::<u16>(&mut inp, dist_extra_nbits as usize)?
@@ -539,7 +506,6 @@ impl DecompressBuffered {
                                 0
                             };
                             let dist = DIST_FOR_SYM[distsym] + dist_extra;
-                            println!("dist {}", dist);
 
                             outp.add_match(dist as usize, len as usize).map_err(|_| {
                                 DecompressError::BadLookback {
@@ -549,10 +515,9 @@ impl DecompressBuffered {
                             })?;
                         }
                         256 => {
-                            println!("done!");
                             break;
                         }
-                        _ => return Err(DecompressError::BadHuffLit),
+                        _ => return Err(DecompressError::BadHuffSym),
                     }
                 }
             }
