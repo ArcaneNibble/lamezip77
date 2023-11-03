@@ -32,6 +32,8 @@ pub enum DecompressError {
     InvalidHDist,
     InvalidHuffNoSyms,
     InvalidCodeLenRep,
+    BadNLen { len: u16, nlen: u16 },
+    BadHuffLit,
     Truncated,
 }
 
@@ -59,6 +61,12 @@ impl core::fmt::Display for DecompressError {
             }
             DecompressError::InvalidCodeLenRep => {
                 write!(f, "Invalid repeat in Huffman tree code lengths")
+            }
+            DecompressError::BadNLen { len, nlen } => {
+                write!(f, "Bad LEN/NLEN ({:04X}/{:04X})", len, nlen)
+            }
+            DecompressError::BadHuffLit => {
+                write!(f, "An invalid value was encoded for a literal/length")
             }
             DecompressError::Truncated => {
                 write!(f, "Input is truncated")
@@ -311,7 +319,7 @@ impl Default for LitSym {
 }
 impl From<(usize, u8)> for LitSym {
     fn from((value, nbits): (usize, u8)) -> Self {
-        debug_assert!(value <= 285);
+        debug_assert!(value <= 287);
         debug_assert!(nbits <= 15);
         let mut ret = 0;
         let ret_v = ret.view_bits_mut::<Msb0>();
@@ -334,7 +342,7 @@ impl SymTyTrait for LitSym {
 #[derive(Clone)]
 pub struct DecompressBuffered {
     coded_lengths_decoder: CanonicalHuffmanDecoder<CodedLenSym, 19, 7, 8, 128>,
-    lit_decoder: CanonicalHuffmanDecoder<LitSym, 286, 15, 16, { 1 << 15 }>,
+    lit_decoder: CanonicalHuffmanDecoder<LitSym, 288, 15, 16, { 1 << 15 }>,
     dist_decoder: CanonicalHuffmanDecoder<DistSym, 30, 15, 16, { 1 << 15 }>,
 }
 
@@ -344,6 +352,20 @@ impl DecompressBuffered {
             coded_lengths_decoder: CanonicalHuffmanDecoder::new(),
             lit_decoder: CanonicalHuffmanDecoder::new(),
             dist_decoder: CanonicalHuffmanDecoder::new(),
+        }
+    }
+    pub fn new_boxed() -> Box<Self> {
+        unsafe {
+            let layout = core::alloc::Layout::new::<Self>();
+            let p = std::alloc::alloc(layout) as *mut Self;
+            CanonicalHuffmanDecoder::initialize_at(core::ptr::addr_of_mut!(
+                (*p).coded_lengths_decoder
+            ));
+            let p = std::alloc::alloc(layout) as *mut Self;
+            CanonicalHuffmanDecoder::initialize_at(core::ptr::addr_of_mut!((*p).lit_decoder));
+            let p = std::alloc::alloc(layout) as *mut Self;
+            CanonicalHuffmanDecoder::initialize_at(core::ptr::addr_of_mut!((*p).dist_decoder));
+            Box::from_raw(p)
         }
     }
 
@@ -358,16 +380,48 @@ impl DecompressBuffered {
             let btype = get_bits_num::<u8, 2>(&mut inp)?;
             println!("btype {} bfinal {}", btype, bfinal);
 
-            match btype {
-                0 => {
-                    println!("stored block");
-                    todo!()
+            if btype == 3 {
+                return Err(DecompressError::InvalidBlockType);
+            } else if btype == 0 {
+                println!("stored block");
+                let leftover_bits = inp.len() % 8;
+                println!("dropping {} bits", leftover_bits);
+                let _ = get_bits_slice(&mut inp, leftover_bits);
+
+                // xxx efficiency???
+                let len = get_bits_num::<u16, 16>(&mut inp)?;
+                let nlen = get_bits_num::<u16, 16>(&mut inp)?;
+                println!("len {} nlen {}", len, nlen);
+                if len != !nlen {
+                    return Err(DecompressError::BadNLen { len, nlen });
                 }
-                1 => {
+
+                for _ in 0..len {
+                    let b = get_bits_num::<u8, 8>(&mut inp)?;
+                    outp.add_lit(b);
+                }
+            } else {
+                self.lit_decoder.reset();
+                self.dist_decoder.reset();
+
+                if btype == 1 {
                     println!("fixed huff");
-                    todo!()
-                }
-                2 => {
+                    let mut lit_lens = [0; 288];
+                    for i in 0..=143 {
+                        lit_lens[i] = 8;
+                    }
+                    for i in 144..=255 {
+                        lit_lens[i] = 9;
+                    }
+                    for i in 256..=279 {
+                        lit_lens[i] = 7;
+                    }
+                    for i in 280..=287 {
+                        lit_lens[i] = 8;
+                    }
+                    self.lit_decoder.init(&lit_lens).unwrap();
+                    self.dist_decoder.init(&[5; 30]).unwrap();
+                } else {
                     println!("dynamic huff");
                     let hlit = get_bits_num::<u16, 5>(&mut inp)? + 257;
                     let hdist = get_bits_num::<u8, 5>(&mut inp)? + 1;
@@ -453,53 +507,54 @@ impl DecompressBuffered {
                     } else {
                         println!("no dists used");
                     }
+                }
 
-                    loop {
-                        let litsym: usize = self.lit_decoder.read_sym(&mut inp)?.into();
-                        println!("lit sym {:03X}", litsym);
+                println!("doing huff");
 
-                        match litsym {
-                            0..=0xff => {
-                                outp.add_lit(litsym as u8);
-                            }
-                            257..=285 => {
-                                let len_extra_nbits = LEN_EXTRA_BITS[litsym - 257];
-                                let len_extra = if len_extra_nbits > 0 {
-                                    get_bits_num_dyn::<u16>(&mut inp, len_extra_nbits as usize)?
-                                } else {
-                                    0
-                                };
-                                let len = LEN_FOR_SYM[litsym - 257] + len_extra;
-                                println!("len {}", len);
+                loop {
+                    let litsym: usize = self.lit_decoder.read_sym(&mut inp)?.into();
+                    println!("lit sym {:03X}", litsym);
 
-                                let distsym: usize = self.dist_decoder.read_sym(&mut inp)?.into();
-                                println!("dist sym {}", distsym);
-                                debug_assert!(distsym <= 29);
-                                let dist_extra_nbits = DIST_EXTRA_BITS[distsym];
-                                let dist_extra = if dist_extra_nbits > 0 {
-                                    get_bits_num_dyn::<u16>(&mut inp, dist_extra_nbits as usize)?
-                                } else {
-                                    0
-                                };
-                                let dist = DIST_FOR_SYM[distsym] + dist_extra;
-                                println!("dist {}", dist);
-
-                                outp.add_match(dist as usize, len as usize).map_err(|x| {
-                                    DecompressError::BadLookback {
-                                        disp: dist,
-                                        avail: outp.cur_pos() as u16,
-                                    }
-                                })?;
-                            }
-                            256 => {
-                                println!("done!");
-                                break;
-                            }
-                            _ => unreachable!(),
+                    match litsym {
+                        0..=0xff => {
+                            outp.add_lit(litsym as u8);
                         }
+                        257..=285 => {
+                            let len_extra_nbits = LEN_EXTRA_BITS[litsym - 257];
+                            let len_extra = if len_extra_nbits > 0 {
+                                get_bits_num_dyn::<u16>(&mut inp, len_extra_nbits as usize)?
+                            } else {
+                                0
+                            };
+                            let len = LEN_FOR_SYM[litsym - 257] + len_extra;
+                            println!("len {}", len);
+
+                            let distsym: usize = self.dist_decoder.read_sym(&mut inp)?.into();
+                            println!("dist sym {}", distsym);
+                            debug_assert!(distsym <= 29);
+                            let dist_extra_nbits = DIST_EXTRA_BITS[distsym];
+                            let dist_extra = if dist_extra_nbits > 0 {
+                                get_bits_num_dyn::<u16>(&mut inp, dist_extra_nbits as usize)?
+                            } else {
+                                0
+                            };
+                            let dist = DIST_FOR_SYM[distsym] + dist_extra;
+                            println!("dist {}", dist);
+
+                            outp.add_match(dist as usize, len as usize).map_err(|_| {
+                                DecompressError::BadLookback {
+                                    disp: dist,
+                                    avail: outp.cur_pos() as u16,
+                                }
+                            })?;
+                        }
+                        256 => {
+                            println!("done!");
+                            break;
+                        }
+                        _ => return Err(DecompressError::BadHuffLit),
                     }
                 }
-                _ => return Err(DecompressError::InvalidBlockType),
             }
 
             if bfinal != 0 {
@@ -522,5 +577,64 @@ impl DecompressBuffered {
         let mut buf = VecBuf::new(0, max_sz);
         self.decompress(inp, &mut buf)?;
         Ok(buf.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs::File,
+        io::{BufWriter, Write},
+        process::Command,
+    };
+
+    use super::*;
+
+    #[test]
+    fn deflate_buffered_ref_decompress() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("tests/deflate.bin");
+        let ref_fn = d.join("deflatetest/tool.c");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+        let ref_ = std::fs::read(ref_fn).unwrap();
+
+        let mut dec = DecompressBuffered::new();
+        let out = dec.decompress_new(&inp, usize::MAX).unwrap();
+
+        assert_eq!(out, ref_);
+    }
+
+    #[test]
+    fn deflate_buffered_ref_decompress_stored() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("tests/deflate-stored.bin");
+        let ref_fn = d.join("deflatetest/tool.c");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+        let ref_ = std::fs::read(ref_fn).unwrap();
+
+        let mut dec = DecompressBuffered::new();
+        let out = dec.decompress_new(&inp, usize::MAX).unwrap();
+
+        assert_eq!(out, ref_);
+    }
+
+    #[test]
+    fn deflate_buffered_ref_decompress_fixed() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("tests/deflate-fixed.bin");
+        let ref_fn = d.join("deflatetest/tool.c");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+        let ref_ = std::fs::read(ref_fn).unwrap();
+
+        let mut dec = DecompressBuffered::new();
+        let out = dec.decompress_new(&inp, usize::MAX).unwrap();
+
+        assert_eq!(out, ref_);
     }
 }
