@@ -688,9 +688,9 @@ struct CompressState<const HUFF_BUF_SZ: usize> {
     pending_bits: u8,
     pending_bits_count: usize,
     len_lit_probabilities: [u16; 286],
-    len_lit_denom: u16,
+    len_lit_denom: usize,
     dist_probabilities: [u16; 30],
-    dist_denom: u16,
+    dist_denom: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -767,24 +767,11 @@ impl<const NSYMS: usize, const NSYMS_TIMES_2: usize, const NBITS: usize>
         debug_assert!(item.prob > 0);
         match item.i {
             PackMergeItemInner::Leaf { sym } => {
-                println!(
-                    "got coin, denom 2^-{}, prob {} sym {}",
-                    iter + 1,
-                    item.prob,
-                    sym
-                );
                 nbits[sym as usize] += 1;
             }
             PackMergeItemInner::Package { a, b } => {
                 let a_item = self.iters[iter + 1].pkgs[a];
                 let b_item = self.iters[iter + 1].pkgs[b];
-                println!(
-                    "got package, denom 2^-{}, prob {}, {:?}, {:?}",
-                    iter + 1,
-                    item.prob,
-                    a_item,
-                    b_item
-                );
                 self.incr_nbits(nbits, &a_item, iter + 1);
                 self.incr_nbits(nbits, &b_item, iter + 1);
             }
@@ -815,11 +802,9 @@ impl<const NSYMS: usize, const NSYMS_TIMES_2: usize, const NBITS: usize>
                 });
             }
         }
-        println!("start iter: {:?}", last_iter);
 
         // newer levels
         for denom_iter in (1..NBITS).rev() {
-            println!("build huff: building denomination 2^-{}", denom_iter);
             let (this_iter, last_iter) =
                 &mut ret.iters[denom_iter - 1..=denom_iter].split_at_mut(1);
             let this_iter = &mut this_iter[0];
@@ -847,8 +832,6 @@ impl<const NSYMS: usize, const NSYMS_TIMES_2: usize, const NBITS: usize>
                 };
                 this_iter.insert(newitem);
             }
-
-            println!("this iter build result: {:?}", this_iter);
         }
 
         debug_assert!(num_nonzero_probs > 0);
@@ -858,7 +841,6 @@ impl<const NSYMS: usize, const NSYMS_TIMES_2: usize, const NBITS: usize>
             let item = ret.iters[0].pkgs[i];
             ret.incr_nbits(&mut sym_nbits, &item, 0);
         }
-        println!("symbol bits: {:?}", sym_nbits);
 
         sym_nbits
     }
@@ -903,17 +885,6 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
     where
         O: FnMut(u8),
     {
-        if self.pending_bits_count > 0 {
-            println!(
-                "out bits: have {:0l1$b} adding {:0l2$b}",
-                self.pending_bits,
-                bits,
-                l1 = self.pending_bits_count,
-                l2 = nbits
-            );
-        } else {
-            println!("out bits: have nothing adding {:0l2$b}", bits, l2 = nbits);
-        }
         debug_assert!(nbits <= 16);
         bits = bits & ((1 << nbits) - 1);
         let mut work = self.pending_bits as u32;
@@ -922,35 +893,22 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
 
         let mut totbits = self.pending_bits_count + nbits;
         while totbits >= 8 {
-            println!("out bits: {:02X}", (work & 0xff));
             outp((work & 0xff) as u8);
             work >>= 8;
             totbits -= 8;
         }
         self.pending_bits = (work & 0xff) as u8;
         self.pending_bits_count = totbits;
-        println!(
-            "out bits: now {:0l1$b}",
-            self.pending_bits,
-            l1 = self.pending_bits_count,
-        );
     }
 
     fn do_huff_buf<O>(&mut self, is_final: bool, mut outp: O)
     where
         O: FnMut(u8),
     {
-        println!("huff buf count {}", self.huff_buf_count);
         self.outbits(is_final as u16, 1, &mut outp);
         if self.huff_buf_count == 0 {
             self.outbits(0b00, 2, &mut outp);
             if self.pending_bits_count > 0 {
-                println!(
-                    "dump final {} bits {:0l$b}",
-                    self.pending_bits_count,
-                    self.pending_bits,
-                    l = self.pending_bits_count
-                );
                 outp(self.pending_bits);
             }
             // len, nlen
@@ -963,24 +921,6 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
             self.len_lit_probabilities[256] += 1;
             self.len_lit_denom += 1;
 
-            println!("doing huffman:");
-            for i in 0..286 {
-                println!(
-                    "lit sym {:3} probability {:3}/{}",
-                    i, self.len_lit_probabilities[i], self.len_lit_denom
-                );
-            }
-            if self.dist_denom == 0 {
-                println!("no distances");
-            } else {
-                for i in 0..30 {
-                    println!(
-                        "dist sym {:2} probability {:2}/{}",
-                        i, self.dist_probabilities[i], self.dist_denom
-                    );
-                }
-            }
-
             // build huffman trees
             let lit_len_sym_nbits =
                 PackMergeState::<286, { 286 * 2 }, 15>::build(&self.len_lit_probabilities);
@@ -990,7 +930,6 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
                     .rev()
                     .position(|&x| x != 0)
                     .unwrap();
-            println!("hlit = {}", hlit);
             if hlit < 257 {
                 hlit = 257;
             }
@@ -1003,7 +942,6 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
             } else {
                 ([0; 30], 1)
             };
-            println!("hdist = {}", hdist);
 
             let mut huff_tree_probs = [0u32; 19];
             let mut huff_trees_codes = [0u8; { 286 + 30 }];
@@ -1053,11 +991,6 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
             }
 
             while let Some(&code) = merged_codes.next() {
-                println!(
-                    "got code {} while looking at {} repeat {}",
-                    code, last_huff_code, last_huff_code_repeats
-                );
-
                 if code != last_huff_code {
                     dump_last_code!();
 
@@ -1089,16 +1022,6 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
             }
             dump_last_code!();
 
-            println!(
-                "huff tree codes: {:?}",
-                &huff_trees_codes[..huff_trees_ncodes]
-            );
-            println!(
-                "huff tree extras: {:?}",
-                &huff_trees_extra[..huff_trees_ncodes]
-            );
-            println!("huff tree code probs: {:?}", huff_tree_probs);
-
             let huff_tree_sym_nbits = PackMergeState::<19, { 19 * 2 }, 7>::build(&huff_tree_probs);
 
             let mut huff_tree_sym_nbits_permuted = [0; 19];
@@ -1106,14 +1029,12 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
                 huff_tree_sym_nbits_permuted[CODE_LEN_ORDER_REVERSE[i] as usize] =
                     huff_tree_sym_nbits[i];
             }
-            println!("permuted tree sym lens: {:?}", huff_tree_sym_nbits_permuted);
             let mut hclen = 19
                 - huff_tree_sym_nbits_permuted
                     .iter()
                     .rev()
                     .position(|&x| x != 0)
                     .unwrap();
-            println!("hclen = {}", hclen);
             if hclen < 4 {
                 hclen = 4;
             }
@@ -1191,14 +1112,10 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
                 &mut outp,
             );
 
+            self.huff_buf_count = 0;
+
             if is_final {
                 if self.pending_bits_count > 0 {
-                    println!(
-                        "dump final for huff: {} bits {:0l$b}",
-                        self.pending_bits_count,
-                        self.pending_bits,
-                        l = self.pending_bits_count
-                    );
                     outp(self.pending_bits);
                 }
             }
