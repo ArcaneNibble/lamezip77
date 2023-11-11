@@ -265,7 +265,13 @@ impl<const ALPHABET_SZ: usize> CanonicalHuffmanEncoder<ALPHABET_SZ> {
                 codes_at_bit_count[l as usize] += 1;
             }
         }
-        assert!(min_code_len != u8::MAX);
+
+        let mut codes = [0; ALPHABET_SZ];
+        let mut nbits = [0; ALPHABET_SZ];
+        if min_code_len == u8::MAX {
+            // no codes, return dummy
+            return Self { codes, nbits };
+        }
 
         let mut next_code_at_bit_count = [0u16; 16];
         let mut code = 0;
@@ -274,9 +280,6 @@ impl<const ALPHABET_SZ: usize> CanonicalHuffmanEncoder<ALPHABET_SZ> {
             next_code_at_bit_count[i] = code;
         }
 
-        let mut codes = [0; ALPHABET_SZ];
-        let mut nbits = [0; ALPHABET_SZ];
-
         for sym in 0..ALPHABET_SZ {
             let l = if sym < code_lens.len() {
                 code_lens[sym] as usize
@@ -284,7 +287,9 @@ impl<const ALPHABET_SZ: usize> CanonicalHuffmanEncoder<ALPHABET_SZ> {
                 0
             };
             if l > 0 {
-                let code = next_code_at_bit_count[l];
+                let mut code = next_code_at_bit_count[l];
+                let code_v = code.view_bits_mut::<Lsb0>();
+                code_v[..l].reverse();
                 codes[sym] = code;
                 nbits[sym] = l as u8;
                 next_code_at_bit_count[l] += 1;
@@ -996,9 +1001,7 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
                 debug_assert!(hdist >= 1);
                 (dist_sym_nbits, hdist)
             } else {
-                let mut dummy = [0; 30];
-                dummy[0] = 1;
-                (dummy, 0)
+                ([0; 30], 1)
             };
             println!("hdist = {}", hdist);
 
@@ -1134,11 +1137,11 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
                     &mut outp,
                 );
                 if code == 16 {
-                    self.outbits(huff_trees_extra[huff_trees_ncodes] as u16, 2, &mut outp);
+                    self.outbits(huff_trees_extra[i] as u16, 2, &mut outp);
                 } else if code == 17 {
-                    self.outbits(huff_trees_extra[huff_trees_ncodes] as u16, 3, &mut outp);
+                    self.outbits(huff_trees_extra[i] as u16, 3, &mut outp);
                 } else if code == 18 {
-                    self.outbits(huff_trees_extra[huff_trees_ncodes] as u16, 7, &mut outp);
+                    self.outbits(huff_trees_extra[i] as u16, 7, &mut outp);
                 }
             }
 
