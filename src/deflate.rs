@@ -1359,4 +1359,82 @@ mod tests {
 
         assert_eq!(out, ref_);
     }
+
+    #[test]
+    fn deflate_roundtrip_zerobytes() {
+        let mut comp = Compress::<32768>::new_boxed();
+        let mut compressed_out = Vec::new();
+        comp.compress(&[], true, |x| compressed_out.push(x));
+
+        let mut dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(decompress_ourselves, []);
+    }
+
+    #[test]
+    fn deflate_roundtrip_bytewise() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("src/deflate.rs");
+        let outp_fn = d.join("deflate-roundtrip-bytewise.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut comp = Compress::<32768>::new_boxed();
+        let mut compressed_out = Vec::new();
+        for i in 0..inp.len() {
+            comp.compress(&[inp[i]], false, |x| compressed_out.push(x));
+        }
+        comp.compress(&[], true, |x| compressed_out.push(x));
+
+        let mut outp_f = BufWriter::new(File::create(&outp_fn).unwrap());
+        outp_f.write(&compressed_out).unwrap();
+        drop(outp_f);
+
+        let mut dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(inp, decompress_ourselves);
+
+        let ref_fn = d.join("deflate-roundtrip-bytewise.out");
+        Command::new("./deflatetest/tool")
+            .arg("d")
+            .arg(outp_fn.to_str().unwrap())
+            .arg(ref_fn.to_str().unwrap())
+            .status()
+            .unwrap();
+        let decompress_ref = std::fs::read(&ref_fn).unwrap();
+        assert_eq!(inp, decompress_ref);
+    }
+
+    #[test]
+    fn deflate_roundtrip_wholefile() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let inp_fn = d.join("src/deflate.rs");
+        let outp_fn = d.join("deflate-roundtrip-wholefile.bin");
+
+        let inp = std::fs::read(inp_fn).unwrap();
+
+        let mut comp = Compress::<32768>::new_boxed();
+        let mut compressed_out = Vec::new();
+        comp.compress(&inp, true, |x| compressed_out.push(x));
+
+        let mut outp_f = BufWriter::new(File::create(&outp_fn).unwrap());
+        outp_f.write(&compressed_out).unwrap();
+        drop(outp_f);
+
+        let mut dec = DecompressBuffered::new();
+        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        assert_eq!(inp, decompress_ourselves);
+
+        let ref_fn = d.join("deflate-roundtrip-wholefile.out");
+        Command::new("./deflatetest/tool")
+            .arg("d")
+            .arg(outp_fn.to_str().unwrap())
+            .arg(ref_fn.to_str().unwrap())
+            .status()
+            .unwrap();
+        let decompress_ref = std::fs::read(&ref_fn).unwrap();
+        assert_eq!(inp, decompress_ref);
+    }
 }
