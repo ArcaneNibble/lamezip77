@@ -1,3 +1,4 @@
+use core::fmt::Debug;
 use std::error::Error;
 
 use bitvec::prelude::*;
@@ -7,6 +8,9 @@ use crate::{util::*, LZEngine, LZOutput, LZSettings};
 const CODE_LEN_ALPHABET_SIZE: usize = 19;
 const CODE_LEN_ORDER: [u8; CODE_LEN_ALPHABET_SIZE] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
+const CODE_LEN_ORDER_REVERSE: [u8; CODE_LEN_ALPHABET_SIZE] = [
+    3, 17, 15, 13, 11, 9, 7, 5, 4, 6, 8, 10, 12, 14, 16, 18, 0, 1, 2,
 ];
 const LEN_FOR_SYM: [u16; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
@@ -80,7 +84,7 @@ impl Error for DecompressError {}
 const LOOKBACK_SZ: usize = 32768;
 
 #[inline]
-pub fn get_bits_num<T: funty::Integral, const N: usize>(
+fn get_bits_num<T: funty::Integral, const N: usize>(
     inp: &mut &BitSlice<u8>,
 ) -> Result<T, DecompressError> {
     if inp.len() < N {
@@ -93,7 +97,7 @@ pub fn get_bits_num<T: funty::Integral, const N: usize>(
 }
 
 #[inline]
-pub fn get_bits_num_dyn<T: funty::Integral>(
+fn get_bits_num_dyn<T: funty::Integral>(
     inp: &mut &BitSlice<u8>,
     n: usize,
 ) -> Result<T, DecompressError> {
@@ -108,7 +112,7 @@ pub fn get_bits_num_dyn<T: funty::Integral>(
 }
 
 #[inline]
-pub fn get_bits_slice<'a>(
+fn get_bits_slice<'a>(
     inp: &mut &'a BitSlice<u8>,
     n: usize,
 ) -> Result<&'a BitSlice<u8>, DecompressError> {
@@ -141,7 +145,7 @@ impl<
         const TWO_POW_MAX_LEN: usize,
     > CanonicalHuffmanDecoder<SymTy, ALPHABET_SZ, MAX_LEN, MAX_LEN_PLUS_ONE, TWO_POW_MAX_LEN>
 {
-    pub fn init(&mut self, code_lens: &[u8]) -> Result<(), DecompressError> {
+    fn init(&mut self, code_lens: &[u8]) -> Result<(), DecompressError> {
         assert!(MAX_LEN < 16); // hard limit good enough for deflate
         assert!(1 << MAX_LEN == TWO_POW_MAX_LEN);
         assert!(MAX_LEN + 1 == MAX_LEN_PLUS_ONE);
@@ -191,7 +195,7 @@ impl<
         Ok(())
     }
 
-    pub fn read_sym(&self, inp: &mut &BitSlice<u8>) -> Result<SymTy, DecompressError> {
+    fn read_sym(&self, inp: &mut &BitSlice<u8>) -> Result<SymTy, DecompressError> {
         let min_code = get_bits_slice(inp, self.min_code_len)?;
         let mut cur_code = 0u16;
         let cur_code_v = cur_code.view_bits_mut::<Msb0>();
@@ -213,20 +217,20 @@ impl<
         Ok(sym)
     }
 
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             lookup: [SymTy::default(); TWO_POW_MAX_LEN],
             min_code_len: 0,
         }
     }
-    pub(crate) unsafe fn initialize_at(p: *mut Self) {
+    unsafe fn initialize_at(p: *mut Self) {
         let p_lookup = core::ptr::addr_of_mut!((*p).lookup);
         for i in 0..TWO_POW_MAX_LEN {
             (*p_lookup)[i] = SymTy::default();
         }
         (*p).min_code_len = 0;
     }
-    pub fn reset(&mut self) {
+    fn reset(&mut self) {
         for i in 0..TWO_POW_MAX_LEN {
             self.lookup[i] = SymTy::default();
         }
@@ -236,6 +240,59 @@ impl<
 
 trait SymTyTrait: Default + Copy + core::fmt::Debug + From<(usize, u8)> + Into<usize> + Eq {
     fn nbits(&self) -> u8;
+}
+
+#[derive(Debug)]
+struct CanonicalHuffmanEncoder<const ALPHABET_SZ: usize> {
+    codes: [u16; ALPHABET_SZ],
+    nbits: [u8; ALPHABET_SZ],
+}
+
+impl<const ALPHABET_SZ: usize> CanonicalHuffmanEncoder<ALPHABET_SZ> {
+    fn new(code_lens: &[u8]) -> Self {
+        assert!(code_lens.len() <= ALPHABET_SZ);
+
+        let mut codes_at_bit_count = [0u16; 16];
+        let mut min_code_len = u8::MAX;
+        for sym in 0..ALPHABET_SZ {
+            let l = if sym < code_lens.len() {
+                code_lens[sym]
+            } else {
+                0
+            };
+            if l > 0 {
+                min_code_len = core::cmp::min(min_code_len, l);
+                codes_at_bit_count[l as usize] += 1;
+            }
+        }
+        assert!(min_code_len != u8::MAX);
+
+        let mut next_code_at_bit_count = [0u16; 16];
+        let mut code = 0;
+        for i in 1..=15 {
+            code = (code + codes_at_bit_count[i - 1]) << 1;
+            next_code_at_bit_count[i] = code;
+        }
+
+        let mut codes = [0; ALPHABET_SZ];
+        let mut nbits = [0; ALPHABET_SZ];
+
+        for sym in 0..ALPHABET_SZ {
+            let l = if sym < code_lens.len() {
+                code_lens[sym] as usize
+            } else {
+                0
+            };
+            if l > 0 {
+                let code = next_code_at_bit_count[l];
+                codes[sym] = code;
+                nbits[sym] = l as u8;
+                next_code_at_bit_count[l] += 1;
+            }
+        }
+
+        Self { codes, nbits }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -547,23 +604,277 @@ impl DecompressBuffered {
     }
 }
 
+// sym, extra, #extra
+const fn len_to_huff(len: u16) -> (u16, u8, u8) {
+    match len {
+        3 => (257, 0, 0),
+        4 => (258, 0, 0),
+        5 => (259, 0, 0),
+        6 => (260, 0, 0),
+        7 => (261, 0, 0),
+        8 => (262, 0, 0),
+        9 => (263, 0, 0),
+        10 => (264, 0, 0),
+        11..=12 => (265, (len - 11) as u8, 1),
+        13..=14 => (266, (len - 13) as u8, 1),
+        15..=16 => (267, (len - 15) as u8, 1),
+        17..=18 => (268, (len - 17) as u8, 1),
+        19..=22 => (269, (len - 19) as u8, 2),
+        23..=26 => (270, (len - 23) as u8, 2),
+        27..=30 => (271, (len - 27) as u8, 2),
+        31..=34 => (272, (len - 31) as u8, 2),
+        35..=42 => (273, (len - 35) as u8, 3),
+        43..=50 => (274, (len - 43) as u8, 3),
+        51..=58 => (275, (len - 51) as u8, 3),
+        59..=66 => (276, (len - 59) as u8, 3),
+        67..=82 => (277, (len - 67) as u8, 4),
+        83..=98 => (278, (len - 83) as u8, 4),
+        99..=114 => (279, (len - 99) as u8, 4),
+        115..=130 => (280, (len - 115) as u8, 4),
+        131..=162 => (281, (len - 131) as u8, 5),
+        163..=194 => (282, (len - 163) as u8, 5),
+        195..=226 => (283, (len - 195) as u8, 5),
+        227..=257 => (284, (len - 227) as u8, 5),
+        258 => (285, 0, 0),
+        _ => unreachable!(),
+    }
+}
+
+// sym, extra, #extra
+const fn dist_to_huff(dist: u16) -> (u8, u16, u8) {
+    match dist {
+        1 => (0, 0, 0),
+        2 => (1, 0, 0),
+        3 => (2, 0, 0),
+        4 => (3, 0, 0),
+        5..=6 => (4, dist - 5, 1),
+        7..=8 => (5, dist - 7, 1),
+        9..=12 => (6, dist - 9, 2),
+        13..=16 => (7, dist - 13, 2),
+        17..=24 => (8, dist - 17, 3),
+        25..=32 => (9, dist - 25, 3),
+        33..=48 => (10, dist - 33, 4),
+        49..=64 => (11, dist - 49, 4),
+        65..=96 => (12, dist - 65, 5),
+        97..=128 => (13, dist - 97, 5),
+        129..=192 => (14, dist - 129, 6),
+        193..=256 => (15, dist - 193, 6),
+        257..=384 => (16, dist - 257, 7),
+        385..=512 => (17, dist - 385, 7),
+        513..=768 => (18, dist - 513, 8),
+        769..=1024 => (19, dist - 769, 8),
+        1025..=1536 => (20, dist - 1025, 9),
+        1537..=2048 => (21, dist - 1537, 9),
+        2049..=3072 => (22, dist - 2049, 10),
+        3073..=4096 => (23, dist - 3073, 10),
+        4097..=6144 => (24, dist - 4097, 11),
+        6145..=8192 => (25, dist - 6145, 11),
+        8193..=12288 => (26, dist - 8193, 12),
+        12289..=16384 => (27, dist - 12289, 12),
+        16385..=24576 => (28, dist - 16385, 13),
+        24577..=32768 => (29, dist - 24577, 13),
+        _ => unreachable!(),
+    }
+}
+
 struct CompressState<const HUFF_BUF_SZ: usize> {
     huff_buf: [u16; HUFF_BUF_SZ],
     huff_buf_count: usize,
     pending_bits: u8,
     pending_bits_count: usize,
+    len_lit_probabilities: [u16; 286],
+    len_lit_denom: u16,
+    dist_probabilities: [u16; 30],
+    dist_denom: u16,
+}
+
+#[derive(Clone, Copy)]
+enum PackMergeItemInner {
+    Leaf { sym: u16 },
+    Package { a: usize, b: usize },
+}
+
+impl Default for PackMergeItemInner {
+    fn default() -> Self {
+        Self::Leaf { sym: 0 }
+    }
+}
+
+impl Debug for PackMergeItemInner {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Leaf { sym } => write!(f, "{}", sym),
+            Self::Package { a, b } => write!(f, "{{{}, {}}}", a, b),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PackMergeItem {
+    prob: u32,
+    i: PackMergeItemInner,
+}
+
+impl Debug for PackMergeItem {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{{prob = {}, {:?}}}", self.prob, self.i)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PackMergeIteration<const NSYMS_TIMES_2: usize> {
+    pkgs: [PackMergeItem; NSYMS_TIMES_2],
+    npkgs: usize,
+}
+
+impl<const NSYMS_TIMES_2: usize> Default for PackMergeIteration<NSYMS_TIMES_2> {
+    fn default() -> Self {
+        Self {
+            pkgs: [PackMergeItem::default(); NSYMS_TIMES_2],
+            npkgs: 0,
+        }
+    }
+}
+
+impl<const NSYMS_TIMES_2: usize> Debug for PackMergeIteration<NSYMS_TIMES_2> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write! {f, "{:?}", &self.pkgs[..self.npkgs]}
+    }
+}
+
+impl<const NSYMS_TIMES_2: usize> PackMergeIteration<NSYMS_TIMES_2> {
+    fn insert(&mut self, item: PackMergeItem) {
+        let insert_idx = self.pkgs[..self.npkgs].partition_point(|x| x.prob < item.prob);
+        self.pkgs[insert_idx..].rotate_right(1);
+        self.pkgs[insert_idx] = item;
+        self.npkgs += 1;
+    }
+}
+
+struct PackMergeState<const NSYMS: usize, const NSYMS_TIMES_2: usize, const NBITS: usize> {
+    iters: [PackMergeIteration<NSYMS_TIMES_2>; NBITS],
+}
+
+impl<const NSYMS: usize, const NSYMS_TIMES_2: usize, const NBITS: usize>
+    PackMergeState<NSYMS, NSYMS_TIMES_2, NBITS>
+{
+    fn incr_nbits(&mut self, nbits: &mut [u8], item: &PackMergeItem, iter: usize) {
+        debug_assert!(item.prob > 0);
+        match item.i {
+            PackMergeItemInner::Leaf { sym } => {
+                println!(
+                    "got coin, denom 2^-{}, prob {} sym {}",
+                    iter + 1,
+                    item.prob,
+                    sym
+                );
+                nbits[sym as usize] += 1;
+            }
+            PackMergeItemInner::Package { a, b } => {
+                let a_item = self.iters[iter + 1].pkgs[a];
+                let b_item = self.iters[iter + 1].pkgs[b];
+                println!(
+                    "got package, denom 2^-{}, prob {}, {:?}, {:?}",
+                    iter + 1,
+                    item.prob,
+                    a_item,
+                    b_item
+                );
+                self.incr_nbits(nbits, &a_item, iter + 1);
+                self.incr_nbits(nbits, &b_item, iter + 1);
+            }
+        }
+    }
+
+    fn build<ProbType: Copy + Into<u32>>(sym_prob_table: &[ProbType]) -> [u8; NSYMS] {
+        let mut ret = Self {
+            iters: [PackMergeIteration::default(); NBITS],
+        };
+
+        assert!(NSYMS * 2 == NSYMS_TIMES_2);
+        assert!(NSYMS_TIMES_2 % 2 == 0);
+        assert!(sym_prob_table.len() * 2 <= NSYMS_TIMES_2);
+        assert!(NBITS <= 16);
+        assert!(NSYMS <= u16::MAX as usize);
+
+        let mut num_nonzero_probs = 0;
+
+        // base level -- all leaves
+        let last_iter = &mut ret.iters[NBITS - 1];
+        for i in 0..NSYMS {
+            if sym_prob_table[i].into() > 0 {
+                num_nonzero_probs += 1;
+                last_iter.insert(PackMergeItem {
+                    prob: sym_prob_table[i].into(),
+                    i: PackMergeItemInner::Leaf { sym: i as u16 },
+                });
+            }
+        }
+        println!("start iter: {:?}", last_iter);
+
+        // newer levels
+        for denom_iter in (1..NBITS).rev() {
+            println!("build huff: building denomination 2^-{}", denom_iter);
+            let (this_iter, last_iter) =
+                &mut ret.iters[denom_iter - 1..=denom_iter].split_at_mut(1);
+            let this_iter = &mut this_iter[0];
+            let last_iter = &last_iter[0];
+            // let this_iter = &mut ret.iters[denom_iter - 1];
+            // leafs
+            for i in 0..NSYMS {
+                if sym_prob_table[i].into() > 0 {
+                    this_iter.insert(PackMergeItem {
+                        prob: sym_prob_table[i].into(),
+                        i: PackMergeItemInner::Leaf { sym: i as u16 },
+                    });
+                }
+            }
+
+            for last_iter_i in (0..last_iter.npkgs).step_by(2) {
+                let a = &last_iter.pkgs[last_iter_i];
+                let b = &last_iter.pkgs[last_iter_i + 1];
+                let newitem = PackMergeItem {
+                    prob: a.prob + b.prob,
+                    i: PackMergeItemInner::Package {
+                        a: last_iter_i,
+                        b: last_iter_i + 1,
+                    },
+                };
+                this_iter.insert(newitem);
+            }
+
+            println!("this iter build result: {:?}", this_iter);
+        }
+
+        debug_assert!(num_nonzero_probs > 0);
+
+        let mut sym_nbits = [0; NSYMS];
+        for i in 0..(2 * num_nonzero_probs - 2) {
+            let item = ret.iters[0].pkgs[i];
+            ret.incr_nbits(&mut sym_nbits, &item, 0);
+        }
+        println!("symbol bits: {:?}", sym_nbits);
+
+        sym_nbits
+    }
 }
 
 impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
     fn new() -> Self {
+        assert!(HUFF_BUF_SZ <= u16::MAX as usize);
         Self {
             huff_buf: [0; HUFF_BUF_SZ],
             huff_buf_count: 0,
             pending_bits: 0,
             pending_bits_count: 0,
+            len_lit_probabilities: [0; 286],
+            len_lit_denom: 0,
+            dist_probabilities: [0; 30],
+            dist_denom: 0,
         }
     }
     unsafe fn initialize_at(p: *mut Self) {
+        assert!(HUFF_BUF_SZ <= u16::MAX as usize);
         let p_huff_buf = core::ptr::addr_of_mut!((*p).huff_buf);
         for i in 0..HUFF_BUF_SZ {
             (*p_huff_buf)[i] = 0;
@@ -571,6 +882,16 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
         (*p).huff_buf_count = 0;
         (*p).pending_bits = 0;
         (*p).pending_bits_count = 0;
+        let p_len_lit_probs = core::ptr::addr_of_mut!((*p).len_lit_probabilities);
+        for i in 0..286 {
+            (*p_len_lit_probs)[i] = 0;
+        }
+        (*p).len_lit_denom = 0;
+        let p_dist_probs = core::ptr::addr_of_mut!((*p).dist_probabilities);
+        for i in 0..30 {
+            (*p_dist_probs)[i] = 0;
+        }
+        (*p).dist_denom = 0;
     }
 
     fn outbits<O>(&mut self, mut bits: u16, nbits: usize, mut outp: O)
@@ -633,8 +954,285 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
             outp(0xff);
             outp(0xff);
         } else {
-            todo!()
+            // end of block
+            self.len_lit_probabilities[256] += 1;
+            self.len_lit_denom += 1;
+
+            println!("doing huffman:");
+            for i in 0..286 {
+                println!(
+                    "lit sym {:3} probability {:3}/{}",
+                    i, self.len_lit_probabilities[i], self.len_lit_denom
+                );
+            }
+            if self.dist_denom == 0 {
+                println!("no distances");
+            } else {
+                for i in 0..30 {
+                    println!(
+                        "dist sym {:2} probability {:2}/{}",
+                        i, self.dist_probabilities[i], self.dist_denom
+                    );
+                }
+            }
+
+            // build huffman trees
+            let lit_len_sym_nbits =
+                PackMergeState::<286, { 286 * 2 }, 15>::build(&self.len_lit_probabilities);
+            let mut hlit = 286
+                - lit_len_sym_nbits
+                    .iter()
+                    .rev()
+                    .position(|&x| x != 0)
+                    .unwrap();
+            println!("hlit = {}", hlit);
+            if hlit < 257 {
+                hlit = 257;
+            }
+            let (dist_sym_nbits, hdist) = if self.dist_denom != 0 {
+                let dist_sym_nbits =
+                    PackMergeState::<30, { 30 * 2 }, 15>::build(&self.dist_probabilities);
+                let hdist = 30 - dist_sym_nbits.iter().rev().position(|&x| x != 0).unwrap();
+                debug_assert!(hdist >= 1);
+                (dist_sym_nbits, hdist)
+            } else {
+                let mut dummy = [0; 30];
+                dummy[0] = 1;
+                (dummy, 0)
+            };
+            println!("hdist = {}", hdist);
+
+            let mut huff_tree_probs = [0u32; 19];
+            let mut huff_trees_codes = [0u8; { 286 + 30 }];
+            let mut huff_trees_extra = [0u8; { 286 + 30 }];
+            let mut huff_trees_ncodes = 0;
+            let mut merged_codes = lit_len_sym_nbits[..hlit]
+                .iter()
+                .chain(dist_sym_nbits[..hdist].iter());
+            let mut last_huff_code = 0xff;
+            let mut last_huff_code_repeats = 0;
+
+            macro_rules! dump_last_code {
+                () => {
+                    if last_huff_code != 0xff {
+                        if (last_huff_code == 0 && last_huff_code_repeats <= 2)
+                            || (last_huff_code != 0 && last_huff_code_repeats <= 3)
+                        {
+                            for _ in 0..last_huff_code_repeats {
+                                huff_trees_codes[huff_trees_ncodes] = last_huff_code;
+                                huff_tree_probs[last_huff_code as usize] += 1;
+                                huff_trees_ncodes += 1;
+                            }
+                        } else if last_huff_code == 0 {
+                            debug_assert!(last_huff_code_repeats <= 138);
+                            if last_huff_code_repeats <= 10 {
+                                huff_trees_codes[huff_trees_ncodes] = 17;
+                                huff_trees_extra[huff_trees_ncodes] = last_huff_code_repeats - 3;
+                                huff_tree_probs[17] += 1;
+                                huff_trees_ncodes += 1;
+                            } else {
+                                huff_trees_codes[huff_trees_ncodes] = 18;
+                                huff_trees_extra[huff_trees_ncodes] = last_huff_code_repeats - 11;
+                                huff_tree_probs[18] += 1;
+                                huff_trees_ncodes += 1;
+                            }
+                        } else {
+                            debug_assert!(last_huff_code_repeats <= 7);
+                            huff_trees_codes[huff_trees_ncodes] = last_huff_code;
+                            huff_trees_codes[huff_trees_ncodes + 1] = 16;
+                            huff_trees_extra[huff_trees_ncodes + 1] = last_huff_code_repeats - 4;
+                            huff_tree_probs[last_huff_code as usize] += 1;
+                            huff_tree_probs[16] += 1;
+                            huff_trees_ncodes += 2;
+                        }
+                    }
+                };
+            }
+
+            while let Some(&code) = merged_codes.next() {
+                println!(
+                    "got code {} while looking at {} repeat {}",
+                    code, last_huff_code, last_huff_code_repeats
+                );
+
+                if code != last_huff_code {
+                    dump_last_code!();
+
+                    last_huff_code = code;
+                    last_huff_code_repeats = 1;
+                } else {
+                    last_huff_code_repeats += 1;
+                    if code != 0 && last_huff_code_repeats == 7 {
+                        // full
+                        huff_trees_codes[huff_trees_ncodes] = code;
+                        huff_trees_codes[huff_trees_ncodes + 1] = 16;
+                        huff_trees_extra[huff_trees_ncodes + 1] = 3;
+                        huff_tree_probs[code as usize] += 1;
+                        huff_tree_probs[16] += 1;
+                        huff_trees_ncodes += 2;
+                        last_huff_code = 0xff;
+                        last_huff_code_repeats = 0;
+                    }
+                    if code == 0 && last_huff_code_repeats == 138 {
+                        // full
+                        huff_trees_codes[huff_trees_ncodes] = 18;
+                        huff_trees_extra[huff_trees_ncodes] = 0x7f;
+                        huff_tree_probs[18] += 1;
+                        huff_trees_ncodes += 1;
+                        last_huff_code = 0xff;
+                        last_huff_code_repeats = 0;
+                    }
+                }
+            }
+            dump_last_code!();
+
+            println!(
+                "huff tree codes: {:?}",
+                &huff_trees_codes[..huff_trees_ncodes]
+            );
+            println!(
+                "huff tree extras: {:?}",
+                &huff_trees_extra[..huff_trees_ncodes]
+            );
+            println!("huff tree code probs: {:?}", huff_tree_probs);
+
+            let huff_tree_sym_nbits = PackMergeState::<19, { 19 * 2 }, 7>::build(&huff_tree_probs);
+
+            let mut huff_tree_sym_nbits_permuted = [0; 19];
+            for i in 0..19 {
+                huff_tree_sym_nbits_permuted[CODE_LEN_ORDER_REVERSE[i] as usize] =
+                    huff_tree_sym_nbits[i];
+            }
+            println!("permuted tree sym lens: {:?}", huff_tree_sym_nbits_permuted);
+            let mut hclen = 19
+                - huff_tree_sym_nbits_permuted
+                    .iter()
+                    .rev()
+                    .position(|&x| x != 0)
+                    .unwrap();
+            println!("hclen = {}", hclen);
+            if hclen < 4 {
+                hclen = 4;
+            }
+
+            // TODO detect incompressible data
+            self.outbits(0b10, 2, &mut outp);
+            self.outbits((hlit - 257) as u16, 5, &mut outp);
+            self.outbits((hdist - 1) as u16, 5, &mut outp);
+            self.outbits((hclen - 4) as u16, 4, &mut outp);
+
+            for i in 0..hclen {
+                self.outbits(huff_tree_sym_nbits_permuted[i] as u16, 3, &mut outp);
+            }
+
+            let huff_trees_encoder = CanonicalHuffmanEncoder::<19>::new(&huff_tree_sym_nbits);
+            for i in 0..huff_trees_ncodes {
+                let code = huff_trees_codes[i];
+                self.outbits(
+                    huff_trees_encoder.codes[code as usize],
+                    huff_trees_encoder.nbits[code as usize] as usize,
+                    &mut outp,
+                );
+                if code == 16 {
+                    self.outbits(huff_trees_extra[huff_trees_ncodes] as u16, 2, &mut outp);
+                } else if code == 17 {
+                    self.outbits(huff_trees_extra[huff_trees_ncodes] as u16, 3, &mut outp);
+                } else if code == 18 {
+                    self.outbits(huff_trees_extra[huff_trees_ncodes] as u16, 7, &mut outp);
+                }
+            }
+
+            let huff_lit_len_encoder = CanonicalHuffmanEncoder::<286>::new(&lit_len_sym_nbits);
+            let huff_dist_encoder = CanonicalHuffmanEncoder::<30>::new(&dist_sym_nbits);
+
+            let mut i = 0;
+            while i < self.huff_buf_count {
+                let thing = self.huff_buf[i];
+                if thing & 0x8000 == 0 {
+                    // lit
+                    self.outbits(
+                        huff_lit_len_encoder.codes[thing as usize],
+                        huff_lit_len_encoder.nbits[thing as usize] as usize,
+                        &mut outp,
+                    );
+                    i += 1;
+                } else {
+                    // ref
+                    let len = thing & 0x7fff;
+                    let disp = self.huff_buf[i + 1] + 1;
+                    let (len_sym, len_extra, len_nextra) = len_to_huff(len);
+                    self.outbits(
+                        huff_lit_len_encoder.codes[len_sym as usize],
+                        huff_lit_len_encoder.nbits[len_sym as usize] as usize,
+                        &mut outp,
+                    );
+                    if len_nextra > 0 {
+                        self.outbits(len_extra as u16, len_nextra as usize, &mut outp);
+                    }
+                    let (disp_sym, disp_extra, disp_nextra) = dist_to_huff(disp);
+                    self.outbits(
+                        huff_dist_encoder.codes[disp_sym as usize],
+                        huff_dist_encoder.nbits[disp_sym as usize] as usize,
+                        &mut outp,
+                    );
+                    if disp_nextra > 0 {
+                        self.outbits(disp_extra as u16, disp_nextra as usize, &mut outp);
+                    }
+                    i += 2;
+                }
+            }
+
+            self.outbits(
+                huff_lit_len_encoder.codes[256],
+                huff_lit_len_encoder.nbits[256] as usize,
+                &mut outp,
+            );
+
+            if is_final {
+                if self.pending_bits_count > 0 {
+                    println!(
+                        "dump final for huff: {} bits {:0l$b}",
+                        self.pending_bits_count,
+                        self.pending_bits,
+                        l = self.pending_bits_count
+                    );
+                    outp(self.pending_bits);
+                }
+            }
         }
+    }
+
+    fn add_lit<O>(&mut self, lit: u8, outp: O)
+    where
+        O: FnMut(u8),
+    {
+        if self.huff_buf_count == HUFF_BUF_SZ {
+            self.do_huff_buf(false, outp);
+        }
+        self.huff_buf[self.huff_buf_count] = lit as u16;
+        self.huff_buf_count += 1;
+        self.len_lit_probabilities[lit as usize] += 1;
+        self.len_lit_denom += 1;
+    }
+
+    fn add_ref<O>(&mut self, disp: u16, len: u16, outp: O)
+    where
+        O: FnMut(u8),
+    {
+        if self.huff_buf_count >= HUFF_BUF_SZ - 1 {
+            self.do_huff_buf(false, outp);
+        }
+        self.huff_buf[self.huff_buf_count] = (len as u16) | 0x8000;
+        self.huff_buf[self.huff_buf_count + 1] = (disp - 1) as u16;
+        self.huff_buf_count += 2;
+
+        let (len_sym, _, _) = len_to_huff(len);
+        self.len_lit_probabilities[len_sym as usize] += 1;
+        self.len_lit_denom += 1;
+
+        let (disp_sym, _, _) = dist_to_huff(disp);
+        self.dist_probabilities[disp_sym as usize] += 1;
+        self.dist_denom += 1;
     }
 }
 
@@ -681,11 +1279,7 @@ impl<const HUFF_BUF_SZ: usize> Compress<HUFF_BUF_SZ> {
         self.engine
             .compress::<_, ()>(&settings, inp, end_of_stream, |x| match x {
                 LZOutput::Lit(lit) => {
-                    if s.huff_buf_count == HUFF_BUF_SZ {
-                        s.do_huff_buf(false, &mut outp);
-                    }
-                    s.huff_buf[s.huff_buf_count] = lit as u16;
-                    s.huff_buf_count += 1;
+                    s.add_lit(lit, &mut outp);
                     Ok(())
                 }
                 LZOutput::Ref { disp, len } => {
@@ -693,12 +1287,7 @@ impl<const HUFF_BUF_SZ: usize> Compress<HUFF_BUF_SZ> {
                     debug_assert!(disp <= 32768);
                     debug_assert!(len >= 3);
                     debug_assert!(len <= 258);
-                    if s.huff_buf_count >= HUFF_BUF_SZ - 1 {
-                        s.do_huff_buf(false, &mut outp);
-                    }
-                    s.huff_buf[s.huff_buf_count] = (len as u16) | 0x8000;
-                    s.huff_buf[s.huff_buf_count + 1] = (disp - 1) as u16;
-                    s.huff_buf_count += 2;
+                    s.add_ref(disp as u16, len as u16, &mut outp);
                     Ok(())
                 }
             })
