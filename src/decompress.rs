@@ -18,37 +18,30 @@ const DUMMY_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 );
 const DUMMY_WAKER: RawWaker = RawWaker::new(core::ptr::null(), &DUMMY_WAKER_VTABLE);
 
-struct InputWithBuf<'a, const BUFSZ: usize> {
+struct InputWithBuf<const BUFSZ: usize> {
     buf: [u8; BUFSZ],
     nbuf: usize,
-    inp: &'a [u8],
+    inp: *const [u8],
 }
 
-impl<'a, const BUFSZ: usize> InputWithBuf<'a, BUFSZ> {
+impl<const BUFSZ: usize> InputWithBuf<BUFSZ> {
     fn new() -> Self {
         Self {
             buf: [0; BUFSZ],
             nbuf: 0,
-            inp: &[],
+            inp: core::ptr::slice_from_raw_parts(core::ptr::null(), 0),
         }
-    }
-
-    fn add_inp<'inp: 'a>(&mut self, inp: &'inp [u8]) {
-        debug_assert!(self.inp.len() == 0);
-        self.inp = inp;
     }
 }
 
-pub struct InputPeeker<'a, 'b, 'c, const BUFSZ: usize, const PEEKSZ: usize> {
-    buf: &'a RefCell<InputWithBuf<'b, BUFSZ>>,
+pub struct InputPeeker<'a, 'c, const BUFSZ: usize, const PEEKSZ: usize> {
+    buf: &'a RefCell<InputWithBuf<BUFSZ>>,
     nwaiting: &'c Cell<usize>,
 }
 
-impl<'a, 'b, 'c, const BUFSZ: usize, const PEEKSZ: usize> InputPeeker<'a, 'b, 'c, BUFSZ, PEEKSZ> {
-    fn new(
-        input_with_buf: &'a RefCell<InputWithBuf<'b, BUFSZ>>,
-        nwaiting: &'c Cell<usize>,
-    ) -> Self {
+impl<'a, 'c, const BUFSZ: usize, const PEEKSZ: usize> InputPeeker<'a, 'c, BUFSZ, PEEKSZ> {
+    fn new(input_with_buf: &'a RefCell<InputWithBuf<BUFSZ>>, nwaiting: &'c Cell<usize>) -> Self {
+        assert!(PEEKSZ <= BUFSZ);
         Self {
             buf: input_with_buf,
             nwaiting,
@@ -56,44 +49,68 @@ impl<'a, 'b, 'c, const BUFSZ: usize, const PEEKSZ: usize> InputPeeker<'a, 'b, 'c
     }
 }
 
-impl<'a, 'b, 'c, const BUFSZ: usize, const PEEKSZ: usize> Future
-    for &InputPeeker<'a, 'b, 'c, BUFSZ, PEEKSZ>
+impl<'a, 'c, const BUFSZ: usize, const PEEKSZ: usize> Future
+    for &InputPeeker<'a, 'c, BUFSZ, PEEKSZ>
 {
     type Output = [u8; PEEKSZ];
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // FIXME optimize copying?
         let s = self.get_mut();
         let mut input_with_buf = s.buf.borrow_mut();
-        let (mut buf, nbuf, inp) = (input_with_buf.buf, input_with_buf.nbuf, input_with_buf.inp);
-        let n_missing = BUFSZ - nbuf;
-        let n_to_copy = core::cmp::min(n_missing, inp.len());
-        buf[nbuf..(nbuf + n_to_copy)].copy_from_slice(&inp[..n_to_copy]);
-        input_with_buf.buf = buf;
-        input_with_buf.inp = &inp[n_to_copy..];
-        input_with_buf.nbuf += n_to_copy;
+        let mut data = [0; PEEKSZ];
 
         if PEEKSZ <= input_with_buf.nbuf {
-            let mut data = [0; PEEKSZ];
             data.copy_from_slice(&input_with_buf.buf[..PEEKSZ]);
             input_with_buf.buf.copy_within(PEEKSZ.., 0);
             input_with_buf.nbuf -= PEEKSZ;
             s.nwaiting.set(0);
             Poll::Ready(data)
         } else {
-            let nwaiting = PEEKSZ - input_with_buf.nbuf;
-            s.nwaiting.set(nwaiting);
-            Poll::Pending
+            // SAFETY: StreamingDecompressState.add_inp is the only thing that
+            // can set inp. It ensures that inp is valid before any calls to us (poll)
+            // and then invalidates it after the async decompress function returns
+            // so that the pointer doesn't dangle past its actual valid lifetime
+            let inp = unsafe {
+                if !input_with_buf.inp.is_null() {
+                    &*input_with_buf.inp
+                } else {
+                    &[]
+                }
+            };
+            let nbuf = input_with_buf.nbuf;
+            let tot_avail = nbuf + inp.len();
+
+            if PEEKSZ > tot_avail {
+                input_with_buf.buf[nbuf..(nbuf + inp.len())].copy_from_slice(inp);
+                input_with_buf.nbuf += inp.len();
+                input_with_buf.inp = core::ptr::slice_from_raw_parts(core::ptr::null(), 0);
+                s.nwaiting.set(PEEKSZ - tot_avail);
+                Poll::Pending
+            } else {
+                if nbuf == 0 {
+                    data.copy_from_slice(&inp[..PEEKSZ]);
+                    input_with_buf.inp = &inp[PEEKSZ..];
+                    s.nwaiting.set(0);
+                    Poll::Ready(data)
+                } else {
+                    data[..nbuf].copy_from_slice(&input_with_buf.buf[..nbuf]);
+                    data[nbuf..].copy_from_slice(&inp[..(PEEKSZ - nbuf)]);
+                    input_with_buf.nbuf = 0;
+                    input_with_buf.inp = &inp[(PEEKSZ - nbuf)..];
+                    s.nwaiting.set(0);
+                    Poll::Ready(data)
+                }
+            }
         }
     }
 }
 
-pub struct StreamingDecompressExecState<'a, const BUFSZ: usize> {
-    inp: RefCell<InputWithBuf<'a, BUFSZ>>,
+pub struct StreamingDecompressExecState<const BUFSZ: usize> {
+    inp: RefCell<InputWithBuf<BUFSZ>>,
     nwaiting: Cell<usize>,
 }
 
-impl<'a, const BUFSZ: usize> StreamingDecompressExecState<'a, BUFSZ> {
+impl<const BUFSZ: usize> StreamingDecompressExecState<BUFSZ> {
     pub fn new() -> Self {
         Self {
             inp: RefCell::new(InputWithBuf::new()),
@@ -101,43 +118,57 @@ impl<'a, const BUFSZ: usize> StreamingDecompressExecState<'a, BUFSZ> {
         }
     }
 
-    pub fn get_peeker<const N: usize>(&self) -> InputPeeker<'_, 'a, '_, BUFSZ, N> {
+    pub fn get_peeker<const N: usize>(&self) -> InputPeeker<'_, '_, BUFSZ, N> {
         InputPeeker::new(&self.inp, &self.nwaiting)
-    }
-
-    fn add_inp(&self, inp: &'a [u8]) {
-        let mut x = self.inp.borrow_mut();
-        x.add_inp(inp);
     }
 }
 
-pub struct StreamingDecompressState<'a, 'b, F, E, const BUFSZ: usize>
+pub struct StreamingDecompressState<'a, F, E, const BUFSZ: usize>
 where
     F: Future<Output = Result<(), E>>,
 {
-    s: &'a StreamingDecompressExecState<'b, BUFSZ>,
+    s: &'a StreamingDecompressExecState<BUFSZ>,
     f: Pin<&'a mut F>,
 }
 
-impl<'a, 'b, F, E, const BUFSZ: usize> StreamingDecompressState<'a, 'b, F, E, BUFSZ>
+impl<'a, F, E, const BUFSZ: usize> StreamingDecompressState<'a, F, E, BUFSZ>
 where
     F: Future<Output = Result<(), E>>,
 {
-    pub fn new(s: &'a StreamingDecompressExecState<'b, BUFSZ>, f: Pin<&'a mut F>) -> Self {
+    pub fn new(s: &'a StreamingDecompressExecState<BUFSZ>, f: Pin<&'a mut F>) -> Self {
         Self { s, f }
     }
 
-    pub fn add_inp(&mut self, inp: &'b [u8]) -> Result<usize, E> {
-        self.s.add_inp(inp);
+    pub fn add_inp(&mut self, inp: &[u8]) -> Result<usize, E> {
+        {
+            let mut input_with_buf = self.s.inp.borrow_mut();
+            debug_assert!(input_with_buf.inp.is_null());
+            input_with_buf.inp = inp;
+        }
 
         let waker = unsafe { &Waker::from_raw(DUMMY_WAKER) };
         let mut cx = Context::from_waker(waker);
         let poll_result = self.f.as_mut().poll(&mut cx);
 
-        match poll_result {
+        let ret = match poll_result {
             Poll::Ready(result) => result.map(|_| 0),
             Poll::Pending => Ok(self.s.nwaiting.get()),
+        };
+
+        {
+            let mut input_with_buf = self.s.inp.borrow_mut();
+            if !input_with_buf.inp.is_null() {
+                // if there is data left, we *must* be completed or errored
+                // XXX this is not valid if the decompress function blocks on anything else other than
+                // peeking, but that's not the intended use case
+                if let Ok(nwaiting) = ret {
+                    debug_assert_eq!(nwaiting, 0);
+                }
+            }
+            input_with_buf.inp = core::ptr::slice_from_raw_parts(core::ptr::null(), 0);
         }
+
+        ret
     }
 }
 pub trait LZOutputBuf {
@@ -460,8 +491,8 @@ mod tests {
     }
 
     async fn testfunc(
-        peek1: InputPeeker<'_, '_, '_, 8, 1>,
-        peek2: InputPeeker<'_, '_, '_, 8, 2>,
+        peek1: InputPeeker<'_, '_, 8, 1>,
+        peek2: InputPeeker<'_, '_, 8, 2>,
     ) -> Result<(), ()> {
         let peeked1 = (&peek1).await;
         assert_eq!(peeked1, [1]);
@@ -478,7 +509,7 @@ mod tests {
 
     #[test]
     fn async_hax_test() {
-        let state = StreamingDecompressExecState::<'_, 8>::new();
+        let state = StreamingDecompressExecState::<8>::new();
         let peek1 = state.get_peeker::<1>();
         let peek2 = state.get_peeker::<2>();
         let x = pin!(testfunc(peek1, peek2));

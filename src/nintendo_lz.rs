@@ -74,18 +74,18 @@ impl Error for DecompressError {}
 
 const LOOKBACK_SZ: usize = 0x1000;
 
-pub struct Decompress<'a, 'b, F>
+pub struct Decompress<'a, F>
 where
     F: Future<Output = Result<(), DecompressError>>,
 {
-    state: StreamingDecompressState<'a, 'b, F, DecompressError, 4>,
+    pub state: StreamingDecompressState<'a, F, DecompressError, 4>,
 }
 
-async fn decompress<O>(
+pub async fn decompress<O>(
     mut outp: O,
-    peek1: InputPeeker<'_, '_, '_, 4, 1>,
-    peek2: InputPeeker<'_, '_, '_, 4, 2>,
-    peek4: InputPeeker<'_, '_, '_, 4, 4>,
+    peek1: InputPeeker<'_, '_, 4, 1>,
+    peek2: InputPeeker<'_, '_, 4, 2>,
+    peek4: InputPeeker<'_, '_, 4, 4>,
 ) -> Result<(), DecompressError>
 where
     O: LZOutputBuf,
@@ -127,11 +127,11 @@ where
     Ok(())
 }
 
-impl<'a, 'b, F> Decompress<'a, 'b, F>
+impl<'a, F> Decompress<'a, F>
 where
     F: Future<Output = Result<(), DecompressError>>,
 {
-    fn add_inp(&mut self, inp: &'b [u8]) -> Result<usize, DecompressError> {
+    pub fn add_inp(&mut self, inp: &[u8]) -> Result<usize, DecompressError> {
         self.state.add_inp(inp)
     }
 }
@@ -495,7 +495,7 @@ mod tests {
         {
             let outp = StreamingOutputBuf::<_, LOOKBACK_SZ>::new(|x| outvec.extend_from_slice(x));
 
-            let innerstate = crate::decompress::StreamingDecompressExecState::<'_, 4>::new();
+            let innerstate = crate::decompress::StreamingDecompressExecState::<4>::new();
             let peek1 = innerstate.get_peeker::<1>();
             let peek2 = innerstate.get_peeker::<2>();
             let peek4 = innerstate.get_peeker::<4>();
@@ -512,8 +512,10 @@ mod tests {
             let ret = decomp.add_inp(&[0]);
             assert_eq!(ret, Ok(1));
 
-            let ret = decomp.add_inp(&[0, 1, 2, 3, 4, 5, 6, 7]);
-            assert_eq!(ret, Ok(1));
+            for i in 0..8 {
+                let ret = decomp.add_inp(&[i]);
+                assert_eq!(ret, Ok(1));
+            }
 
             let ret = decomp.add_inp(&[0]);
             assert_eq!(ret, Ok(1));
