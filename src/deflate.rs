@@ -7,13 +7,12 @@ use std::error::Error;
 #[cfg(feature = "alloc")]
 extern crate alloc as alloc_crate;
 #[cfg(feature = "alloc")]
-use alloc_crate::{alloc, boxed::Box, vec::Vec};
+use alloc_crate::{alloc, boxed::Box};
 
 use bitvec::prelude::*;
 
 use crate::{
     decompress::{InputPeeker, LZOutputBuf, StreamingDecompressState, StreamingOutputBuf},
-    util::*,
     LZEngine, LZOutput, LZSettings,
 };
 
@@ -50,7 +49,6 @@ pub enum DecompressError {
     InvalidCodeLenRep,
     BadNLen { len: u16, nlen: u16 },
     BadHuffSym,
-    Truncated,
 }
 
 impl core::fmt::Display for DecompressError {
@@ -83,9 +81,6 @@ impl core::fmt::Display for DecompressError {
             }
             DecompressError::BadHuffSym => {
                 write!(f, "An invalid symbol was encoded")
-            }
-            DecompressError::Truncated => {
-                write!(f, "Input is truncated")
             }
         }
     }
@@ -238,7 +233,7 @@ where
                 let mut actual_huff_code_i = 0;
                 while actual_huff_code_i < (hlit + hdist as u16) as usize {
                     let code_len_sym = coded_lengths_decoder
-                        .read_sym_2(&mut bitbuf, &peek1)
+                        .read_sym(&mut bitbuf, &peek1)
                         .await?
                         .into();
 
@@ -289,7 +284,7 @@ where
             }
 
             while !outp.is_at_limit() {
-                let litsym = lit_decoder.read_sym_2(&mut bitbuf, &peek1).await?.into();
+                let litsym = lit_decoder.read_sym(&mut bitbuf, &peek1).await?.into();
                 match litsym {
                     0..=0xff => {
                         outp.add_lits(&[litsym as u8]);
@@ -302,7 +297,7 @@ where
                         let len = LEN_FOR_SYM[litsym - 257] + len_extra;
 
                         let distsym: usize =
-                            dist_decoder.read_sym_2(&mut bitbuf, &peek1).await?.into();
+                            dist_decoder.read_sym(&mut bitbuf, &peek1).await?.into();
                         if distsym > 29 {
                             return Err(DecompressError::BadHuffSym);
                         }
@@ -336,48 +331,6 @@ where
 
 pub type Decompress<'a, F> = StreamingDecompressState<'a, F, DecompressError, 2>;
 pub type DecompressBuffer<O> = StreamingOutputBuf<O, LOOKBACK_SZ>;
-
-#[inline]
-fn get_bits_num<T: funty::Integral, const N: usize>(
-    inp: &mut &BitSlice<u8>,
-) -> Result<T, DecompressError> {
-    if inp.len() < N {
-        Err(DecompressError::Truncated)
-    } else {
-        let ret = inp[..N].load_le::<T>();
-        *inp = &inp[N..];
-        Ok(ret)
-    }
-}
-
-#[inline]
-fn get_bits_num_dyn<T: funty::Integral>(
-    inp: &mut &BitSlice<u8>,
-    n: usize,
-) -> Result<T, DecompressError> {
-    debug_assert!(n <= 8 * core::mem::size_of::<T>());
-    if inp.len() < n {
-        Err(DecompressError::Truncated)
-    } else {
-        let ret = inp[..n].load_le::<T>();
-        *inp = &inp[n..];
-        Ok(ret)
-    }
-}
-
-#[inline]
-fn get_bits_slice<'a>(
-    inp: &mut &'a BitSlice<u8>,
-    n: usize,
-) -> Result<&'a BitSlice<u8>, DecompressError> {
-    if inp.len() < n {
-        Err(DecompressError::Truncated)
-    } else {
-        let ret = &inp[..n];
-        *inp = &inp[n..];
-        Ok(ret)
-    }
-}
 
 #[derive(Clone)]
 struct CanonicalHuffmanDecoder<
@@ -449,29 +402,7 @@ impl<
         Ok(())
     }
 
-    fn read_sym(&self, inp: &mut &BitSlice<u8>) -> Result<SymTy, DecompressError> {
-        let min_code = get_bits_slice(inp, self.min_code_len)?;
-        let mut cur_code = 0u16;
-        let cur_code_v = cur_code.view_bits_mut::<Msb0>();
-        cur_code_v[(16 - MAX_LEN)..(16 - MAX_LEN + self.min_code_len)]
-            .clone_from_bitslice(&min_code);
-        let mut cur_code_len = self.min_code_len;
-
-        while self.lookup[cur_code as usize] == SymTy::default()
-            || self.lookup[cur_code as usize].nbits() as usize != cur_code_len
-        {
-            let nextbit: u8 = get_bits_num::<u8, 1>(inp)?;
-            let cur_code_v = cur_code.view_bits_mut::<Msb0>();
-            cur_code_v.set(16 - MAX_LEN + cur_code_len, nextbit != 0);
-            cur_code_len += 1;
-        }
-
-        let sym = self.lookup[cur_code as usize];
-        debug_assert!(sym != SymTy::default());
-        Ok(sym)
-    }
-
-    async fn read_sym_2(
+    async fn read_sym(
         &self,
         bb: &mut BitBuf,
         peek1: &InputPeeker<'_, '_, 2, 1>,
@@ -505,13 +436,6 @@ impl<
             lookup: [SymTy::default(); TWO_POW_MAX_LEN],
             min_code_len: 0,
         }
-    }
-    unsafe fn initialize_at(p: *mut Self) {
-        let p_lookup = core::ptr::addr_of_mut!((*p).lookup);
-        for i in 0..TWO_POW_MAX_LEN {
-            (*p_lookup)[i] = SymTy::default();
-        }
-        (*p).min_code_len = 0;
     }
     fn reset(&mut self) {
         for i in 0..TWO_POW_MAX_LEN {
