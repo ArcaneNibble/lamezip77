@@ -6,24 +6,43 @@ extern crate alloc as alloc_crate;
 #[cfg(feature = "alloc")]
 use alloc_crate::{alloc, boxed::Box};
 
+/// Settings for tuning compression
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LZSettings {
-    // if match >= this, use it immediately and stop searching
+    /// If a match has a length >= this value, use it immediately and stop searching.
+    ///
+    /// `nice_length` in the gzip implementation
     pub good_enough_search_len: u64,
-    // if len > this, don't bother inserting all sliding substrings
-    // into hash table (only head)
+    /// If a match has a length > this value, don't bother inserting all sliding substrings
+    /// into hash table (only insert the head, and then skip everything until the next input after the match)
+    ///
+    /// `max_lazy` in the gzip implementation, only for compression levels <= 3
     pub max_len_to_insert_all_substr: u64,
-    // only follow the hash table at most this many times
+    /// Only follow the hash table at most this many times.
+    ///
+    /// `max_chain` in the gzip implementation
     pub max_prev_chain_follows: u64,
-    // try one position forward to see if it gets better matches
+    /// Don't output matches immediately. Instead, try one position forward to see if it produces a longer match
+    ///
+    /// In the gzip implementation, done for compression levels >= 4
     pub defer_output_match: bool,
-    // don't look for a potentially-longer match if there is already one this good
+    /// Don't look for a potentially-longer match if there is already one this good.
+    /// Only used when [defer_output_match](Self::defer_output_match) is set.
+    ///
+    /// `max_lazy` in the gzip implementation, only for compression levels >= 4
     pub good_enough_defer_len: u64,
-    // if there is already a match this good, follow the chain fewer times
+    /// If there is already a deferred match this long, follow hash table chain fewer times.
+    /// Only used when [defer_output_match](Self::defer_output_match) is set.
+    ///
+    /// `good_length` in the gzip implementation.
     pub search_faster_defer_len: u64,
-    // this is used for nintendo lz s.t. a disp of -1 won't be used
+    /// Minimum distance needed for a match (i.e. larger than 1)
+    ///
+    /// This is used for Nintendo LZ77 in VRAM mode.
     pub min_disp: u64,
-    // some formats need this for reasons
+    /// Hold this number of literals at the end of stream, and output it as a literal run.
+    ///
+    /// This is used to meet LZ4's end-of-stream conditions in a simple way.
     pub eos_holdout_bytes: u64,
 }
 
@@ -42,9 +61,13 @@ impl Default for LZSettings {
     }
 }
 
+/// Something that the LZ77 engine can output.
+/// Either a literal or a backreference.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum LZOutput {
+    /// Literal byte
     Lit(u8),
+    /// Backreference. `disp` is at least 1, where 1 is the last byte output.
     Ref { disp: u64, len: u64 },
 }
 
@@ -61,6 +84,19 @@ struct DeferredMatch {
     best_match_len: u64,
 }
 
+/// Parameterized, streaming LZ77 compression engine
+///
+/// * `LOOKBACK_SZ` specifies the window size
+/// * `LOOKAHEAD_SZ` specifies the number of bytes that will be buffered before attempting to compress any output.
+/// * `TOT_BUF_SZ` must be the sum of `LOOKBACK_SZ` and `LOOKAHEAD_SZ` and is a const generics workaround
+/// * `MIN_MATCH` specifies the minimum length of matches
+/// * `MAX_MATCH` specifies the maximum length of matches. It may be usize::MAX to make this unlimited.
+///    This may exceed `LOOKAHEAD_SZ`, but longer matches are only possible if a large chunk of data is passed to the
+///    compression function in a single call.
+/// * `HASH_BITS` specifies the number of bits to use in hashes.
+/// * `HASH_SZ` must be `1 << HASH_BITS` and is a const generics workaround.
+/// * `DICT_BITS` specifies the number of bits to use in the hash chain table.
+/// * `DICT_SZ` must be `1 << DICT_BITS` and is a const generics workaround.
 pub struct LZEngine<
     const LOOKBACK_SZ: usize,
     const LOOKAHEAD_SZ: usize,
@@ -102,6 +138,7 @@ impl<
         DICT_SZ,
     >
 {
+    /// Construct a new object
     pub fn new() -> Self {
         assert_eq!(HASH_SZ, 1 << HASH_BITS);
         assert_eq!(DICT_SZ, 1 << DICT_BITS);
@@ -119,6 +156,10 @@ impl<
             deferred_match: None,
         }
     }
+    /// Construct a new object in place into a heap-allocated box
+    ///
+    /// This is needed whenever the optimizer refuses to construct the object as desired
+    /// without causing a stack overflow, as this object is large.
     #[cfg(feature = "alloc")]
     pub fn new_boxed() -> Box<Self> {
         unsafe {
@@ -128,6 +169,10 @@ impl<
             Box::from_raw(p)
         }
     }
+    /// Initialize this object in place at a given pointer
+    ///
+    /// This is needed whenever the optimizer refuses to construct the object as desired
+    /// without causing a stack overflow, as this object is large.
     pub unsafe fn initialize_at(p: *mut Self) {
         assert_eq!(HASH_SZ, 1 << HASH_BITS);
         assert_eq!(DICT_SZ, 1 << DICT_BITS);
@@ -144,6 +189,12 @@ impl<
         (*p).deferred_match = None;
     }
 
+    /// Compress some data
+    ///
+    /// * `settings` specifies compression settings. Settings can change between calls, although this is not well-tested.
+    /// * `inp` contains data to compress
+    /// * `end_of_stream` indicates whether there is no more input data, which causes final blocks to get flushed.
+    /// * `outp` is a callback sink for compressed data.
     pub fn compress<O, E>(
         &mut self,
         settings: &LZSettings,

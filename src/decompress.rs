@@ -34,6 +34,7 @@ impl<const BUFSZ: usize> InputWithBuf<BUFSZ> {
     }
 }
 
+/// Used by decompression functions to read input. See README.
 pub struct InputPeeker<'a, 'c, const BUFSZ: usize, const PEEKSZ: usize> {
     buf: &'a RefCell<InputWithBuf<BUFSZ>>,
     nwaiting: &'c Cell<usize>,
@@ -105,6 +106,8 @@ impl<'a, 'c, const BUFSZ: usize, const PEEKSZ: usize> Future
     }
 }
 
+/// Internal struct (that must be visible) that is used to
+/// feed input data into decompression functions. See README.
 pub struct StreamingDecompressInnerState<const BUFSZ: usize> {
     inp: RefCell<InputWithBuf<BUFSZ>>,
     nwaiting: Cell<usize>,
@@ -123,6 +126,8 @@ impl<const BUFSZ: usize> StreamingDecompressInnerState<BUFSZ> {
     }
 }
 
+/// Bundles up the state of a decompressor. Usually re-exported
+/// by individual formats, with some of the generic parameters filled in.
 pub struct StreamingDecompressState<'a, F, E, const BUFSZ: usize>
 where
     F: Future<Output = Result<(), E>>,
@@ -171,13 +176,32 @@ where
         ret
     }
 }
+
+/// Trait for a decompression output sink.
+///
+/// In most cases, you will not have to implement one of these on your own.
+/// [PreallocatedBuf], [VecBuf], and [StreamingOutputBuf] cover most use cases.
 pub trait LZOutputBuf {
+    /// Add the given literal run to the output
     fn add_lits(&mut self, lits: &[u8]);
+    /// Add a backreference to the output
+    ///
+    /// A `disp` of 0 means the most recent byte, i.e. the current position minus 1.
+    /// Increasing `disp` means further backwards
+    ///
+    /// Copy `len` bytes, which as usual for LZ77 may exceed `disp`.
+    ///
+    /// An error must be returned iff `disp` is out of bounds (i.e. past the beginning of the output).
     fn add_match(&mut self, disp: usize, len: usize) -> Result<(), ()>;
+    /// Return the total number of bytes that have been output so far.
     fn cur_pos(&self) -> usize;
+    /// For outputs with a fixed size, or for a known decompression size,
+    /// returns if enough output has been generated.
+    /// This will cause decompression functions to stop requesting to consume additional input.
     fn is_at_limit(&self) -> bool;
 }
 
+/// Decompress into a buffer of fixed size. Construct one using the `From` trait impl.
 pub struct PreallocatedBuf<'a> {
     cur_pos: usize,
     buf: &'a mut [u8],
@@ -222,6 +246,7 @@ impl<'a> LZOutputBuf for PreallocatedBuf<'a> {
     }
 }
 
+/// Decompress into a [Vec], possibly with an upper limit
 #[cfg(feature = "alloc")]
 pub struct VecBuf {
     limit: usize,
@@ -230,6 +255,10 @@ pub struct VecBuf {
 
 #[cfg(feature = "alloc")]
 impl VecBuf {
+    /// Construct a [Vec] output buffer.
+    ///
+    /// * `prealloc` will be passed to [Vec::with_capacity] if nonzero
+    /// * `limit` sets a maximum output size
     pub fn new(prealloc: usize, limit: usize) -> Self {
         let buf = if prealloc > 0 {
             Vec::with_capacity(prealloc)
@@ -277,6 +306,10 @@ impl LZOutputBuf for VecBuf {
     }
 }
 
+/// Decompress into a streaming callback
+///
+/// This structure holds a buffer that must be at least the maximum
+/// sliding window size of the relevant format.
 pub struct StreamingOutputBuf<O, const LOOKBACK_SZ: usize>
 where
     O: FnMut(&[u8]),
@@ -292,6 +325,10 @@ impl<O, const LOOKBACK_SZ: usize> StreamingOutputBuf<O, LOOKBACK_SZ>
 where
     O: FnMut(&[u8]),
 {
+    /// Construct a new object
+    ///
+    /// * `outp` is an output callback that accepts slices of output bytes
+    /// * `limit` sets a maximum output size
     pub fn new(outp: O, limit: usize) -> Self {
         Self {
             outp,
@@ -301,6 +338,10 @@ where
             limit,
         }
     }
+    /// Construct a new object in place into a heap-allocated box
+    ///
+    /// This is needed whenever the optimizer refuses to construct the object as desired
+    /// without causing a stack overflow, as this object is large.
     #[cfg(feature = "alloc")]
     pub fn new_boxed() -> Box<Self> {
         unsafe {

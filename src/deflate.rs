@@ -1,3 +1,5 @@
+//! Handles [DEFLATE](https://datatracker.ietf.org/doc/html/rfc1951) compression
+
 use core::fmt::Debug;
 #[cfg(feature = "std")]
 extern crate std;
@@ -39,15 +41,24 @@ const DIST_EXTRA_BITS: [u16; 30] = [
     13,
 ];
 
+/// Possible decompression errors
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecompressError {
+    /// Tried to encode a match past the beginning of the buffer
     BadLookback { disp: u16, avail: u16 },
+    /// A block type of 0b11 (which is invalid)
     InvalidBlockType,
+    /// HLIT has too many codes
     InvalidHLit,
+    /// HDIST has too many codes
     InvalidHDist,
+    /// A Huffman tree did not contain a single symbol with length > 0
     InvalidHuffNoSyms,
+    /// A Huffman tree code length alphabet repeat instruction was invalid
     InvalidCodeLenRep,
+    /// LEN/NLEN are not ones-complements of each other
     BadNLen { len: u16, nlen: u16 },
+    /// An invalid literal/length/distance symbol was encountered
     BadHuffSym,
 }
 
@@ -91,6 +102,9 @@ impl Error for DecompressError {}
 
 const LOOKBACK_SZ: usize = 32768;
 
+/// Construct a decompressor.
+///
+/// `decompress_make(ident, impl LZOutputBuf, optional crate path)`
 pub use lamezip77_macros::deflate_decompress_make as decompress_make;
 
 struct BitBuf {
@@ -153,6 +167,7 @@ impl BitBuf {
     }
 }
 
+/// Internal decompression function. Most users should use the [decompress_make] macro instead.
 pub async fn decompress_impl<O>(
     outp: &mut O,
     peek1: InputPeeker<'_, '_, 2, 1>,
@@ -325,7 +340,9 @@ where
     Ok(())
 }
 
+/// Type of a decompressor state.
 pub type Decompress<'a, F> = StreamingDecompressState<'a, F, DecompressError, 2>;
+/// [StreamingOutputBuf] with buffer size for this format.
 pub type DecompressBuffer<O> = StreamingOutputBuf<O, LOOKBACK_SZ>;
 
 #[derive(Clone)]
@@ -790,7 +807,7 @@ impl<const NSYMS: usize, const NSYMS_TIMES_2: usize, const NBITS: usize>
                 &mut ret.iters[denom_iter - 1..=denom_iter].split_at_mut(1);
             let this_iter = &mut this_iter[0];
             let last_iter = &last_iter[0];
-            // let this_iter = &mut ret.iters[denom_iter - 1];
+
             // leafs
             for i in 0..NSYMS {
                 if sym_prob_table[i].into() > 0 {
@@ -1137,6 +1154,7 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
     }
 }
 
+/// Compressor for DEFLATE
 pub struct Compress<const HUFF_BUF_SZ: usize> {
     engine:
         LZEngine<LOOKBACK_SZ, 258, { LOOKBACK_SZ + 258 }, 3, 258, 15, { 1 << 15 }, 15, { 1 << 15 }>,

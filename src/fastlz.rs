@@ -1,3 +1,5 @@
+//! Handles [FastLZ](https://github.com/ariya/FastLZ) compression
+
 #[cfg(feature = "std")]
 extern crate std;
 #[cfg(feature = "std")]
@@ -13,9 +15,12 @@ use crate::{
     LZEngine, LZOutput, LZSettings,
 };
 
+/// Possible decompression errors
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecompressError {
+    /// Invalid compression level specified in first byte
     BadCompressionLevel(u8),
+    /// Tried to encode a match past the beginning of the buffer
     BadLookback { disp: u32, avail: u32 },
 }
 
@@ -43,8 +48,12 @@ impl Error for DecompressError {}
 const LV1_LOOKBACK_SZ: usize = 0x1FFF + 1;
 const LV2_LOOKBACK_SZ: usize = 0xFFFF + 0x1FFF + 1;
 
+/// Construct a decompressor.
+///
+/// `decompress_make(ident, impl LZOutputBuf, optional crate path)`
 pub use lamezip77_macros::fastlz_decompress_make as decompress_make;
 
+/// Internal decompression function. Most users should use the [decompress_make] macro instead.
 pub async fn decompress_impl<O>(
     outp: &mut O,
     peek1: InputPeeker<'_, '_, 2, 1>,
@@ -141,9 +150,12 @@ where
     Ok(())
 }
 
+/// Type of a decompressor state.
 pub type Decompress<'a, F> = StreamingDecompressState<'a, F, DecompressError, 2>;
+/// [StreamingOutputBuf] with buffer size for this format.
 pub type DecompressBuffer<O> = StreamingOutputBuf<O, LV2_LOOKBACK_SZ>;
 
+/// Compressor for FastLZ Level 1
 pub struct CompressLevel1 {
     engine: LZEngine<
         LV1_LOOKBACK_SZ,
@@ -256,6 +268,7 @@ impl CompressLevel1 {
     }
 }
 
+/// Compressor for FastLZ Level 2
 pub struct CompressLevel2 {
     engine: LZEngine<
         LV2_LOOKBACK_SZ,

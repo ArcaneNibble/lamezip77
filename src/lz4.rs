@@ -1,3 +1,5 @@
+//! Handles [LZ4](https://github.com/lz4/lz4) compression
+
 #[cfg(feature = "std")]
 extern crate std;
 #[cfg(feature = "std")]
@@ -13,10 +15,11 @@ use crate::{
     LZEngine, LZOutput, LZSettings,
 };
 
+/// Possible decompression errors
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecompressError {
+    /// Tried to encode a match past the beginning of the buffer
     BadLookback { disp: u16, avail: u16 },
-    Truncated,
 }
 
 impl core::fmt::Display for DecompressError {
@@ -29,9 +32,6 @@ impl core::fmt::Display for DecompressError {
                     disp, avail
                 )
             }
-            DecompressError::Truncated => {
-                write!(f, "Input is truncated")
-            }
         }
     }
 }
@@ -41,8 +41,12 @@ impl Error for DecompressError {}
 
 const LOOKBACK_SZ: usize = 65535;
 
+/// Construct a decompressor.
+///
+/// `decompress_make(ident, impl LZOutputBuf, optional crate path)`
 pub use lamezip77_macros::lz4_decompress_make as decompress_make;
 
+/// Internal decompression function. Most users should use the [decompress_make] macro instead.
 pub async fn decompress_impl<O>(
     outp: &mut O,
     peek1: InputPeeker<'_, '_, 2, 1>,
@@ -105,9 +109,15 @@ where
     Ok(())
 }
 
+/// Type of a decompressor state.
 pub type Decompress<'a, F> = StreamingDecompressState<'a, F, DecompressError, 2>;
+/// [StreamingOutputBuf] with buffer size for this format.
 pub type DecompressBuffer<O> = StreamingOutputBuf<O, LOOKBACK_SZ>;
 
+/// Compressor for LZ4
+///
+/// MAJOR LIMITATION: If no match can be found within `MAX_LIT_BUF` bytes, decompression will FAIL.
+/// This is an inherent limitation of how this streaming API interacts with the LZ4 format.
 pub struct Compress<const MAX_LIT_BUF: usize> {
     engine: LZEngine<
         LOOKBACK_SZ,

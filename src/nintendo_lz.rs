@@ -1,3 +1,5 @@
+//! Handles LZ77 as used in the GBA/NDS BIOS.
+
 #[cfg(feature = "std")]
 extern crate std;
 #[cfg(feature = "std")]
@@ -14,10 +16,16 @@ use crate::{
     LZEngine, LZOutput, LZSettings,
 };
 
+/// Possible decompression errors
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecompressError {
+    // Bad magic byte at beginning (not 0x10)
     BadMagic(u8),
-    BadLookback { disp: u16, avail: u16 },
+    /// Tried to encode a match past the beginning of the buffer
+    BadLookback {
+        disp: u16,
+        avail: u16,
+    },
 }
 
 impl core::fmt::Display for DecompressError {
@@ -43,8 +51,12 @@ impl Error for DecompressError {}
 
 const LOOKBACK_SZ: usize = 0x1000;
 
+/// Construct a decompressor.
+///
+/// `decompress_make(ident, impl LZOutputBuf, optional crate path)`
 pub use lamezip77_macros::nintendo_lz_decompress_make as decompress_make;
 
+/// Internal decompression function. Most users should use the [decompress_make] macro instead.
 pub async fn decompress_impl<O>(
     outp: &mut O,
     peek1: InputPeeker<'_, '_, 4, 1>,
@@ -91,9 +103,12 @@ where
     Ok(())
 }
 
+/// Type of a decompressor state.
 pub type Decompress<'a, F> = StreamingDecompressState<'a, F, DecompressError, 4>;
+/// [StreamingOutputBuf] with buffer size for this format.
 pub type DecompressBuffer<O> = StreamingOutputBuf<O, LOOKBACK_SZ>;
 
+/// Compressor for Nintendo LZ77
 pub struct Compress {
     engine:
         LZEngine<LOOKBACK_SZ, 18, { LOOKBACK_SZ + 18 }, 3, 18, 12, { 1 << 12 }, 12, { 1 << 12 }>,
