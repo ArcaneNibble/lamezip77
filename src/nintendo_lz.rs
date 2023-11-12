@@ -1,4 +1,3 @@
-use bitvec::prelude::*;
 #[cfg(feature = "std")]
 extern crate std;
 #[cfg(feature = "std")]
@@ -64,21 +63,19 @@ where
 
     while outp.cur_pos() < encoded_len && !outp.is_at_limit() {
         let flags = (&peek1).await[0];
-        let flags = flags.view_bits::<Msb0>();
 
         for i in 0..8 {
             if outp.cur_pos() == encoded_len || outp.is_at_limit() {
                 break;
             }
 
-            if flags[i] == false {
+            if flags & (1 << (7 - i)) == 0 {
                 let b = (&peek1).await[0];
                 outp.add_lits(&[b]);
             } else {
-                let matchb = (&peek2).await;
-                let matchb = matchb.view_bits::<Msb0>();
-                let disp = matchb[4..].load_be::<usize>();
-                let len = matchb[..4].load_be::<usize>() + 3;
+                let matchb = u16::from_be_bytes((&peek2).await);
+                let disp = (matchb & 0xFFF) as usize;
+                let len = (matchb >> 12) as usize + 3;
 
                 let len = core::cmp::min(len, encoded_len - outp.cur_pos());
 
@@ -160,7 +157,7 @@ impl Compress {
                     match self.buffered_out[i as usize] {
                         LZOutput::Lit(_) => {}
                         LZOutput::Ref { .. } => {
-                            flags.view_bits_mut::<Msb0>().set(i as usize, true);
+                            flags |= 1 << (7 - i);
                         }
                     }
                 }
@@ -180,10 +177,8 @@ impl Compress {
                             let disp = disp - 1;
                             let len = len - 3;
 
-                            let mut matchb = [0u8; 2];
-                            let matchb_v = matchb.view_bits_mut::<Msb0>();
-                            matchb_v[4..].store_be(disp);
-                            matchb_v[..4].store_be(len);
+                            let matchb = ((len << 12) as u16) | (disp as u16);
+                            let matchb = matchb.to_be_bytes();
                             outp(matchb[0]);
                             outp(matchb[1]);
                         }
