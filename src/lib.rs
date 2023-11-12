@@ -1,3 +1,5 @@
+#![no_std]
+
 mod sliding_window;
 
 mod hashtables;

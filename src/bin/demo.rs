@@ -8,6 +8,7 @@ use std::{
 
 use lamezip77::{deflate, fastlz, lz4, nintendo_lz};
 
+#[cfg(feature = "std")]
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<OsString> = env::args_os().collect();
 
@@ -111,4 +112,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     outp_f.write(&outp).unwrap();
 
     Ok(())
+}
+
+#[cfg(not(feature = "std"))]
+fn main() {
+    println!("Demo requires std feature");
 }

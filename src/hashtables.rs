@@ -87,8 +87,10 @@ impl<
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use crate::LZEngine;
+    use std::boxed::Box;
 
     #[test]
     fn hash_3_15() {
@@ -118,6 +120,7 @@ mod tests {
         assert_eq!(h, (0x2 << 12) ^ (0x34 << 8) ^ (0x56 << 4) ^ 0x78);
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn hashing_inp() {
         let mut lz: Box<LZEngine<1, 3, 4, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =
@@ -145,6 +148,7 @@ mod tests {
         assert_eq!(lz.h.htab[0x1c << 10], 5); // end
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn hashing_inp_with_chaining() {
         let mut lz: Box<LZEngine<1, 3, 4, 3, 256, 15, { 1 << 15 }, 16, { 1 << 16 }>> =

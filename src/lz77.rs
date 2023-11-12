@@ -1,6 +1,11 @@
 use crate::hashtables::HashBits;
 use crate::sliding_window::SlidingWindowBuf;
 
+#[cfg(feature = "alloc")]
+extern crate alloc as alloc_crate;
+#[cfg(feature = "alloc")]
+use alloc_crate::{alloc, boxed::Box};
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LZSettings {
     // if match >= this, use it immediately and stop searching
@@ -114,10 +119,11 @@ impl<
             deferred_match: None,
         }
     }
+    #[cfg(feature = "alloc")]
     pub fn new_boxed() -> Box<Self> {
         unsafe {
             let layout = core::alloc::Layout::new::<Self>();
-            let p = std::alloc::alloc(layout) as *mut Self;
+            let p = alloc::alloc(layout) as *mut Self;
             Self::initialize_at(p);
             Box::from_raw(p)
         }
@@ -405,11 +411,16 @@ impl<
     }
 }
 
+#[cfg(feature = "alloc")]
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use std::{
+        boxed::Box,
         fs::File,
         io::{BufWriter, Write},
+        println,
+        vec::Vec,
     };
 
     use super::*;

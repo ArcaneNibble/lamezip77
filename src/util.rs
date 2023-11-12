@@ -1,6 +1,11 @@
 use core::ops::Index;
 use core::slice::SliceIndex;
 
+#[cfg(feature = "alloc")]
+extern crate alloc as alloc_crate;
+#[cfg(feature = "alloc")]
+use alloc_crate::vec::Vec;
+
 // we ideally want this trait to require Index
 // but none of these methods here actually
 // involve the index type. Adding the Index
@@ -71,11 +76,13 @@ impl<'a> MaybeGrowableBuf for FixedBuf<'a> {
     }
 }
 
+#[cfg(feature = "alloc")]
 pub struct VecBuf {
     limit: usize,
     buf: Vec<u8>,
 }
 
+#[cfg(feature = "alloc")]
 impl VecBuf {
     pub fn new(prealloc: usize, limit: usize) -> Self {
         let buf = if prealloc > 0 {
@@ -88,12 +95,14 @@ impl VecBuf {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl Into<Vec<u8>> for VecBuf {
     fn into(self) -> Vec<u8> {
         self.buf
     }
 }
 
+#[cfg(feature = "alloc")]
 impl<I> Index<I> for VecBuf
 where
     I: SliceIndex<[u8]>,
@@ -105,6 +114,7 @@ where
     }
 }
 
+#[cfg(feature = "alloc")]
 impl MaybeGrowableBuf for VecBuf {
     fn add_lit(&mut self, b: u8) {
         if self.buf.len() == self.limit {
@@ -187,6 +197,7 @@ mod tests {
         assert_eq!(buf_, [0x11, 0x22, 0x33, 0x22, 0x33, 0x22, 0x33, 0x22]);
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn util_vec_buf() {
         let mut buf = VecBuf::new(0, 4);
@@ -206,6 +217,7 @@ mod tests {
         assert_eq!(buf[1..3], [0x22, 0x33]);
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn util_vec_buf_match() {
         let mut buf = VecBuf::new(0, 8);

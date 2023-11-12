@@ -1,5 +1,13 @@
 use core::fmt::Debug;
+#[cfg(feature = "std")]
+extern crate std;
+#[cfg(feature = "std")]
 use std::error::Error;
+
+#[cfg(feature = "alloc")]
+extern crate alloc as alloc_crate;
+#[cfg(feature = "alloc")]
+use alloc_crate::{alloc, boxed::Box, vec::Vec};
 
 use bitvec::prelude::*;
 
@@ -79,6 +87,7 @@ impl core::fmt::Display for DecompressError {
     }
 }
 
+#[cfg(feature = "std")]
 impl Error for DecompressError {}
 
 const LOOKBACK_SZ: usize = 32768;
@@ -409,16 +418,17 @@ impl DecompressBuffered {
             dist_decoder: CanonicalHuffmanDecoder::new(),
         }
     }
+    #[cfg(feature = "alloc")]
     pub fn new_boxed() -> Box<Self> {
         unsafe {
             let layout = core::alloc::Layout::new::<Self>();
-            let p = std::alloc::alloc(layout) as *mut Self;
+            let p = alloc::alloc(layout) as *mut Self;
             CanonicalHuffmanDecoder::initialize_at(core::ptr::addr_of_mut!(
                 (*p).coded_lengths_decoder
             ));
-            let p = std::alloc::alloc(layout) as *mut Self;
+            let p = alloc::alloc(layout) as *mut Self;
             CanonicalHuffmanDecoder::initialize_at(core::ptr::addr_of_mut!((*p).lit_decoder));
-            let p = std::alloc::alloc(layout) as *mut Self;
+            let p = alloc::alloc(layout) as *mut Self;
             CanonicalHuffmanDecoder::initialize_at(core::ptr::addr_of_mut!((*p).dist_decoder));
             Box::from_raw(p)
         }
@@ -598,6 +608,7 @@ impl DecompressBuffered {
         self.decompress(inp, &mut FixedBuf::from(outp))
     }
 
+    #[cfg(feature = "alloc")]
     pub fn decompress_new(
         &mut self,
         inp: &[u8],
@@ -742,7 +753,7 @@ impl<const NSYMS_TIMES_2: usize> Default for PackMergeIteration<NSYMS_TIMES_2> {
 }
 
 impl<const NSYMS_TIMES_2: usize> Debug for PackMergeIteration<NSYMS_TIMES_2> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write! {f, "{:?}", &self.pkgs[..self.npkgs]}
     }
 }
@@ -1169,10 +1180,11 @@ impl<const HUFF_BUF_SZ: usize> Compress<HUFF_BUF_SZ> {
             state: CompressState::new(),
         }
     }
+    #[cfg(feature = "alloc")]
     pub fn new_boxed() -> Box<Self> {
         unsafe {
             let layout = core::alloc::Layout::new::<Self>();
-            let p = std::alloc::alloc(layout) as *mut Self;
+            let p = alloc::alloc(layout) as *mut Self;
             LZEngine::initialize_at(core::ptr::addr_of_mut!((*p).engine));
             CompressState::initialize_at(core::ptr::addr_of_mut!((*p).state));
             Box::from_raw(p)
@@ -1219,12 +1231,15 @@ impl<const HUFF_BUF_SZ: usize> Compress<HUFF_BUF_SZ> {
     }
 }
 
+#[cfg(feature = "alloc")]
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use std::{
         fs::File,
         io::{BufWriter, Write},
         process::Command,
+        vec::Vec,
     };
 
     use super::*;

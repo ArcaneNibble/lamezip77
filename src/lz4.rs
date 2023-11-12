@@ -1,5 +1,13 @@
 use bitvec::prelude::*;
+#[cfg(feature = "std")]
+extern crate std;
+#[cfg(feature = "std")]
 use std::error::Error;
+
+#[cfg(feature = "alloc")]
+extern crate alloc as alloc_crate;
+#[cfg(feature = "alloc")]
+use alloc_crate::{alloc, boxed::Box, vec::Vec};
 
 use crate::{util::*, LZEngine, LZOutput, LZSettings};
 
@@ -45,6 +53,7 @@ impl core::fmt::Display for DecompressError {
     }
 }
 
+#[cfg(feature = "std")]
 impl Error for DecompressError {}
 
 const LOOKBACK_SZ: usize = 65535;
@@ -73,10 +82,11 @@ impl DecompressStreaming {
             matchlen: 0,
         }
     }
+    #[cfg(feature = "alloc")]
     pub fn new_boxed() -> Box<Self> {
         unsafe {
             let layout = core::alloc::Layout::new::<Self>();
-            let p = std::alloc::alloc(layout) as *mut Self;
+            let p = alloc::alloc(layout) as *mut Self;
             let p_lookback = core::ptr::addr_of_mut!((*p).lookback);
             for i in 0..LOOKBACK_SZ {
                 // my understanding is that this is safe because u64 doesn't have Drop
@@ -270,6 +280,7 @@ impl DecompressBuffered {
         self.decompress(inp, &mut FixedBuf::from(outp))
     }
 
+    #[cfg(feature = "alloc")]
     pub fn decompress_new(&self, inp: &[u8], max_sz: usize) -> Result<Vec<u8>, DecompressError> {
         let mut buf = VecBuf::new(0, max_sz);
         self.decompress(inp, &mut buf)?;
@@ -302,10 +313,11 @@ impl<const MAX_LIT_BUF: usize> Compress<MAX_LIT_BUF> {
             num_buffered_lits: 0,
         }
     }
+    #[cfg(feature = "alloc")]
     pub fn new_boxed() -> Box<Self> {
         unsafe {
             let layout = core::alloc::Layout::new::<Self>();
-            let p = std::alloc::alloc(layout) as *mut Self;
+            let p = alloc::alloc(layout) as *mut Self;
             LZEngine::initialize_at(core::ptr::addr_of_mut!((*p).engine));
             let p_buffered_lits = core::ptr::addr_of_mut!((*p).buffered_lits);
             for i in 0..MAX_LIT_BUF {
@@ -411,12 +423,16 @@ impl<const MAX_LIT_BUF: usize> Compress<MAX_LIT_BUF> {
     }
 }
 
+#[cfg(feature = "alloc")]
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use std::{
         fs::File,
         io::{BufWriter, Write},
         process::Command,
+        vec,
+        vec::Vec,
     };
 
     use super::*;

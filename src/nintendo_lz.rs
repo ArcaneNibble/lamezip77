@@ -1,5 +1,13 @@
 use bitvec::prelude::*;
+#[cfg(feature = "std")]
+extern crate std;
+#[cfg(feature = "std")]
 use std::error::Error;
+
+#[cfg(feature = "alloc")]
+extern crate alloc as alloc_crate;
+#[cfg(feature = "alloc")]
+use alloc_crate::{alloc, boxed::Box, vec::Vec};
 
 use crate::util::*;
 use crate::{LZEngine, LZOutput, LZSettings};
@@ -57,6 +65,7 @@ impl core::fmt::Display for DecompressError {
     }
 }
 
+#[cfg(feature = "std")]
 impl Error for DecompressError {}
 
 const LOOKBACK_SZ: usize = 0x1000;
@@ -87,10 +96,11 @@ impl DecompressStreaming {
             match_b0: 0,
         }
     }
+    #[cfg(feature = "alloc")]
     pub fn new_boxed() -> Box<Self> {
         unsafe {
             let layout = core::alloc::Layout::new::<Self>();
-            let p = std::alloc::alloc(layout) as *mut Self;
+            let p = alloc::alloc(layout) as *mut Self;
             let p_lookback = core::ptr::addr_of_mut!((*p).lookback);
             for i in 0..LOOKBACK_SZ {
                 // my understanding is that this is safe because u64 doesn't have Drop
@@ -273,6 +283,7 @@ impl DecompressBuffered {
         self.decompress(inp, &mut FixedBuf::from(outp))
     }
 
+    #[cfg(feature = "alloc")]
     pub fn decompress_new(&self, inp: &[u8]) -> Result<Vec<u8>, DecompressError> {
         if inp.len() < 4 {
             return Err(DecompressError::TooShort);
@@ -299,10 +310,11 @@ impl Compress {
             num_buffered_out: 0,
         }
     }
+    #[cfg(feature = "alloc")]
     pub fn new_boxed() -> Box<Self> {
         unsafe {
             let layout = core::alloc::Layout::new::<Self>();
-            let p = std::alloc::alloc(layout) as *mut Self;
+            let p = alloc::alloc(layout) as *mut Self;
             LZEngine::initialize_at(core::ptr::addr_of_mut!((*p).engine));
             let p_buffered_out = core::ptr::addr_of_mut!((*p).buffered_out);
             for i in 0..8 {
@@ -396,11 +408,15 @@ impl Compress {
     }
 }
 
+#[cfg(feature = "alloc")]
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use std::{
         fs::File,
         io::{BufWriter, Write},
+        vec,
+        vec::Vec,
     };
 
     use super::*;
