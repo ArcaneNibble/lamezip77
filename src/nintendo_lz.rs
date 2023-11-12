@@ -1,6 +1,7 @@
 use bitvec::prelude::*;
 #[cfg(feature = "std")]
 extern crate std;
+use core::future::Future;
 #[cfg(feature = "std")]
 use std::error::Error;
 
@@ -10,7 +11,10 @@ extern crate alloc as alloc_crate;
 use alloc_crate::{alloc, boxed::Box, vec::Vec};
 
 use crate::util::*;
-use crate::{LZEngine, LZOutput, LZSettings};
+use crate::{
+    decompress::{InputPeeker, LZOutputBuf, StreamingDecompressState},
+    LZEngine, LZOutput, LZSettings,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DecompressState {
@@ -69,6 +73,68 @@ impl core::fmt::Display for DecompressError {
 impl Error for DecompressError {}
 
 const LOOKBACK_SZ: usize = 0x1000;
+
+pub struct Decompress<'a, 'b, F>
+where
+    F: Future<Output = Result<(), DecompressError>>,
+{
+    state: StreamingDecompressState<'a, 'b, F, DecompressError, 4>,
+}
+
+async fn decompress<O>(
+    mut outp: O,
+    peek1: InputPeeker<'_, '_, '_, 4, 1>,
+    peek2: InputPeeker<'_, '_, '_, 4, 2>,
+    peek4: InputPeeker<'_, '_, '_, 4, 4>,
+) -> Result<(), DecompressError>
+where
+    O: LZOutputBuf,
+{
+    let magic = (&peek4).await;
+    if magic[0] != 0x10 {
+        return Err(DecompressError::BadMagic(magic[0]));
+    }
+    let encoded_len =
+        (magic[1] as usize) | ((magic[2] as usize) << 8) | ((magic[3] as usize) << 16);
+
+    while outp.cur_pos() < encoded_len && !outp.is_at_limit() {
+        let flags = (&peek1).await[0];
+        let flags = flags.view_bits::<Msb0>();
+
+        for i in 0..8 {
+            if outp.cur_pos() == encoded_len || outp.is_at_limit() {
+                break;
+            }
+
+            if flags[i] == false {
+                let b = (&peek1).await[0];
+                outp.add_lits(&[b]);
+            } else {
+                let matchb = (&peek2).await;
+                let matchb = matchb.view_bits::<Msb0>();
+                let disp = matchb[4..].load_be::<usize>();
+                let len = matchb[..4].load_be::<usize>();
+
+                outp.add_match(disp + 1, len + 3)
+                    .map_err(|_| DecompressError::BadLookback {
+                        disp: disp as u16,
+                        avail: outp.cur_pos() as u16,
+                    })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+impl<'a, 'b, F> Decompress<'a, 'b, F>
+where
+    F: Future<Output = Result<(), DecompressError>>,
+{
+    fn add_inp(&mut self, inp: &'b [u8]) -> Result<usize, DecompressError> {
+        self.state.add_inp(inp)
+    }
+}
 
 // technically copy-able, but don't want to make it easy to accidentally do so
 #[derive(Clone)]
@@ -419,7 +485,46 @@ mod tests {
         vec::Vec,
     };
 
+    use crate::decompress::StreamingOutputBuf;
+
     use super::*;
+
+    #[test]
+    fn nin_wip_new_decomp() {
+        let mut outvec = Vec::new();
+        {
+            let outp = StreamingOutputBuf::<_, LOOKBACK_SZ>::new(|x| outvec.extend_from_slice(x));
+
+            let innerstate = crate::decompress::StreamingDecompressExecState::<'_, 4>::new();
+            let peek1 = innerstate.get_peeker::<1>();
+            let peek2 = innerstate.get_peeker::<2>();
+            let peek4 = innerstate.get_peeker::<4>();
+            let x = core::pin::pin!(decompress(outp, peek1, peek2, peek4));
+            let state = crate::decompress::StreamingDecompressState::new(&innerstate, x);
+            let mut decomp = Decompress { state };
+
+            let ret = decomp.add_inp(&[0x10]);
+            assert_eq!(ret, Ok(3));
+
+            let ret = decomp.add_inp(&[10, 0, 0]);
+            assert_eq!(ret, Ok(1));
+
+            let ret = decomp.add_inp(&[0]);
+            assert_eq!(ret, Ok(1));
+
+            let ret = decomp.add_inp(&[0, 1, 2, 3, 4, 5, 6, 7]);
+            assert_eq!(ret, Ok(1));
+
+            let ret = decomp.add_inp(&[0]);
+            assert_eq!(ret, Ok(1));
+            let ret = decomp.add_inp(&[8]);
+            assert_eq!(ret, Ok(1));
+            let ret = decomp.add_inp(&[9]);
+            assert_eq!(ret, Ok(0));
+        }
+
+        assert_eq!(outvec, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
 
     #[test]
     fn nin_all_lits() {
