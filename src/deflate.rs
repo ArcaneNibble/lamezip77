@@ -112,19 +112,17 @@ impl BitBuf {
         debug_assert!(N <= 8 * core::mem::size_of::<T>());
         debug_assert!(self.nbits <= 8);
 
-        let v = self.bits.view_bits_mut::<Lsb0>();
-
         while N > self.nbits as usize {
             let nextbits = peek1.await[0];
-            v[(self.nbits as usize)..(self.nbits as usize + 8)].store_le(nextbits);
+            self.bits |= (nextbits as u32) << self.nbits;
             self.nbits += 8;
         }
 
         debug_assert!(N <= self.nbits as usize);
-        let ret = v[..N].load_le::<T>();
-        v.shift_left(N);
+        let ret = self.bits & ((1 << N) - 1);
+        self.bits >>= N;
         self.nbits -= N as u8;
-        ret
+        T::try_from(ret).unwrap_or_default()
     }
 
     #[inline]
@@ -141,19 +139,17 @@ impl BitBuf {
         debug_assert!(n <= 8 * core::mem::size_of::<T>());
         debug_assert!(self.nbits <= 8);
 
-        let v = self.bits.view_bits_mut::<Lsb0>();
-
         while n > self.nbits as usize {
             let nextbits = peek1.await[0];
-            v[(self.nbits as usize)..(self.nbits as usize + 8)].store_le(nextbits);
+            self.bits |= (nextbits as u32) << self.nbits;
             self.nbits += 8;
         }
 
         debug_assert!(n <= self.nbits as usize);
-        let ret = v[..n].load_le::<T>();
-        v.shift_left(n);
+        let ret = self.bits & ((1 << n) - 1);
+        self.bits >>= n;
         self.nbits -= n as u8;
-        ret
+        T::try_from(ret).unwrap_or_default()
     }
 }
 
@@ -421,8 +417,9 @@ impl<
             || self.lookup[cur_code as usize].nbits() as usize != cur_code_len
         {
             let nextbit = bb.get_bits_as_num::<u8, 1>(peek1).await;
-            let cur_code_v = cur_code.view_bits_mut::<Msb0>();
-            cur_code_v.set(16 - MAX_LEN + cur_code_len, nextbit != 0);
+            if nextbit != 0 {
+                cur_code |= 1 << (MAX_LEN - cur_code_len - 1);
+            }
             cur_code_len += 1;
         }
 
@@ -519,21 +516,18 @@ impl From<(usize, u8)> for CodedLenSym {
     fn from((value, nbits): (usize, u8)) -> Self {
         debug_assert!(value <= 18);
         debug_assert!(nbits <= 7);
-        let mut ret = 0;
-        let ret_v = ret.view_bits_mut::<Msb0>();
-        ret_v[..3].store(nbits);
-        ret_v[3..].store(value);
+        let ret = nbits << 5 | (value as u8);
         Self(ret)
     }
 }
 impl Into<usize> for CodedLenSym {
     fn into(self) -> usize {
-        self.0.view_bits::<Msb0>()[3..].load()
+        (self.0 & 0b11111) as usize
     }
 }
 impl SymTyTrait for CodedLenSym {
     fn nbits(&self) -> u8 {
-        self.0.view_bits::<Msb0>()[..3].load()
+        self.0 >> 5
     }
 }
 
@@ -583,21 +577,18 @@ impl From<(usize, u8)> for LitSym {
     fn from((value, nbits): (usize, u8)) -> Self {
         debug_assert!(value <= 287);
         debug_assert!(nbits <= 15);
-        let mut ret = 0;
-        let ret_v = ret.view_bits_mut::<Msb0>();
-        ret_v[..4].store(nbits);
-        ret_v[4..].store(value);
+        let ret = (nbits as u16) << 12 | (value as u16);
         Self(ret)
     }
 }
 impl Into<usize> for LitSym {
     fn into(self) -> usize {
-        self.0.view_bits::<Msb0>()[4..].load()
+        (self.0 & 0xFFF) as usize
     }
 }
 impl SymTyTrait for LitSym {
     fn nbits(&self) -> u8 {
-        self.0.view_bits::<Msb0>()[..4].load()
+        (self.0 >> 12) as u8
     }
 }
 
@@ -881,8 +872,7 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
         debug_assert!(nbits <= 16);
         bits = bits & ((1 << nbits) - 1);
         let mut work = self.pending_bits as u32;
-        let work_v = work.view_bits_mut::<Lsb0>();
-        work_v[self.pending_bits_count..self.pending_bits_count + nbits].store_le(bits);
+        work |= (bits as u32) << self.pending_bits_count;
 
         let mut totbits = self.pending_bits_count + nbits;
         while totbits >= 8 {
