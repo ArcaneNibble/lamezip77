@@ -3,6 +3,11 @@ members = ["lamezip77_macros"]
 
 [package]
 name = "lamezip77"
+description = "Universal(-ish) LZ77 thing"
+repository = "https://github.com/ArcaneNibble/lamezip77"
+categories = ["no-std::no-alloc", "compression"]
+keywords = ["lz77", "deflate", "fastlz", "lz4"]
+license = "0BSD"
 version = "0.0.1"
 edition = "2021"
 
