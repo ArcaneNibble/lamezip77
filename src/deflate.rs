@@ -11,7 +11,11 @@ use alloc_crate::{alloc, boxed::Box, vec::Vec};
 
 use bitvec::prelude::*;
 
-use crate::{util::*, LZEngine, LZOutput, LZSettings};
+use crate::{
+    decompress::{InputPeeker, LZOutputBuf, StreamingDecompressState, StreamingOutputBuf},
+    util::*,
+    LZEngine, LZOutput, LZSettings,
+};
 
 const CODE_LEN_ALPHABET_SIZE: usize = 19;
 const CODE_LEN_ORDER: [u8; CODE_LEN_ALPHABET_SIZE] = [
@@ -91,6 +95,247 @@ impl core::fmt::Display for DecompressError {
 impl Error for DecompressError {}
 
 const LOOKBACK_SZ: usize = 32768;
+
+pub use lamezip77_macros::deflate_decompress_make as decompress_make;
+
+struct BitBuf {
+    bits: u32,
+    nbits: u8,
+}
+
+impl BitBuf {
+    fn new() -> Self {
+        Self { bits: 0, nbits: 0 }
+    }
+
+    #[inline]
+    async fn get_bits_as_num<T: funty::Integral, const N: usize>(
+        &mut self,
+        peek1: &InputPeeker<'_, '_, 2, 1>,
+    ) -> T {
+        debug_assert!(N <= 16);
+        debug_assert!(N <= 8 * core::mem::size_of::<T>());
+        debug_assert!(self.nbits <= 8);
+
+        let v = self.bits.view_bits_mut::<Lsb0>();
+
+        while N > self.nbits as usize {
+            let nextbits = peek1.await[0];
+            v[(self.nbits as usize)..(self.nbits as usize + 8)].store_le(nextbits);
+            self.nbits += 8;
+        }
+
+        debug_assert!(N <= self.nbits as usize);
+        let ret = v[..N].load_le::<T>();
+        v.shift_left(N);
+        self.nbits -= N as u8;
+        ret
+    }
+
+    #[inline]
+    async fn get_bits_as_num_dyn<T: funty::Integral>(
+        &mut self,
+        n: usize,
+        peek1: &InputPeeker<'_, '_, 2, 1>,
+    ) -> T {
+        if n == 0 {
+            return T::ZERO;
+        }
+
+        debug_assert!(n <= 16);
+        debug_assert!(n <= 8 * core::mem::size_of::<T>());
+        debug_assert!(self.nbits <= 8);
+
+        let v = self.bits.view_bits_mut::<Lsb0>();
+
+        while n > self.nbits as usize {
+            let nextbits = peek1.await[0];
+            v[(self.nbits as usize)..(self.nbits as usize + 8)].store_le(nextbits);
+            self.nbits += 8;
+        }
+
+        debug_assert!(n <= self.nbits as usize);
+        let ret = v[..n].load_le::<T>();
+        v.shift_left(n);
+        self.nbits -= n as u8;
+        ret
+    }
+}
+
+pub async fn decompress_impl<O>(
+    outp: &mut O,
+    peek1: InputPeeker<'_, '_, 2, 1>,
+    peek2: InputPeeker<'_, '_, 2, 2>,
+) -> Result<(), DecompressError>
+where
+    O: LZOutputBuf,
+{
+    let mut bitbuf = BitBuf::new();
+    let mut coded_lengths_decoder = CanonicalHuffmanDecoder::<CodedLenSym, 19, 7, 8, 128>::new();
+    let mut lit_decoder = CanonicalHuffmanDecoder::<LitSym, 288, 15, 16, { 1 << 15 }>::new();
+    let mut dist_decoder = CanonicalHuffmanDecoder::<DistSym, 30, 15, 16, { 1 << 15 }>::new();
+
+    loop {
+        let bfinal = bitbuf.get_bits_as_num::<u8, 1>(&peek1).await;
+        let btype = bitbuf.get_bits_as_num::<u8, 2>(&peek1).await;
+
+        if btype == 3 {
+            return Err(DecompressError::InvalidBlockType);
+        } else if btype == 0 {
+            // implicitly drop everything left in bitbuf
+
+            let len = u16::from_le_bytes((&peek2).await);
+            let nlen = u16::from_le_bytes((&peek2).await);
+            if len != !nlen {
+                return Err(DecompressError::BadNLen { len, nlen });
+            }
+
+            for _ in 0..len {
+                let b = (&peek1).await;
+                outp.add_lits(&b);
+            }
+        } else {
+            lit_decoder.reset();
+            dist_decoder.reset();
+
+            if btype == 1 {
+                let mut lit_lens = [0; 288];
+                for i in 0..=143 {
+                    lit_lens[i] = 8;
+                }
+                for i in 144..=255 {
+                    lit_lens[i] = 9;
+                }
+                for i in 256..=279 {
+                    lit_lens[i] = 7;
+                }
+                for i in 280..=287 {
+                    lit_lens[i] = 8;
+                }
+                lit_decoder.init(&lit_lens).unwrap();
+                dist_decoder.init(&[5; 30]).unwrap();
+            } else {
+                let hlit = bitbuf.get_bits_as_num::<u16, 5>(&peek1).await + 257;
+                let hdist = bitbuf.get_bits_as_num::<u8, 5>(&peek1).await + 1;
+                let hclen = bitbuf.get_bits_as_num::<u8, 4>(&peek1).await + 4;
+                if hlit > 286 {
+                    return Err(DecompressError::InvalidHLit);
+                }
+                if hdist > 30 {
+                    return Err(DecompressError::InvalidHDist);
+                }
+
+                let mut code_len_lens = [0; CODE_LEN_ALPHABET_SIZE];
+                for i in 0..hclen {
+                    let l = bitbuf.get_bits_as_num::<u8, 3>(&peek1).await;
+                    let idx = CODE_LEN_ORDER[i as usize];
+                    code_len_lens[idx as usize] = l;
+                }
+
+                coded_lengths_decoder.init(&code_len_lens)?;
+
+                let mut actual_huff_code_lens = [0u8; 286 + 32];
+                let mut actual_huff_code_i = 0;
+                while actual_huff_code_i < (hlit + hdist as u16) as usize {
+                    let code_len_sym = coded_lengths_decoder
+                        .read_sym_2(&mut bitbuf, &peek1)
+                        .await?
+                        .into();
+
+                    match code_len_sym {
+                        0..=15 => {
+                            actual_huff_code_lens[actual_huff_code_i] = code_len_sym as u8;
+                            actual_huff_code_i += 1;
+                        }
+                        16 => {
+                            let rep = bitbuf.get_bits_as_num::<u8, 2>(&peek1).await + 3;
+                            if actual_huff_code_i == 0 {
+                                return Err(DecompressError::InvalidCodeLenRep);
+                            }
+                            let to_rep = actual_huff_code_lens[actual_huff_code_i - 1];
+                            if actual_huff_code_i + rep as usize > (hlit + hdist as u16) as usize {
+                                return Err(DecompressError::InvalidCodeLenRep);
+                            }
+
+                            for i in 0..rep as usize {
+                                actual_huff_code_lens[actual_huff_code_i + i] = to_rep;
+                            }
+                            actual_huff_code_i += rep as usize;
+                        }
+                        17 => {
+                            let rep = bitbuf.get_bits_as_num::<u8, 3>(&peek1).await + 3;
+                            actual_huff_code_i += rep as usize;
+                        }
+                        18 => {
+                            let rep = bitbuf.get_bits_as_num::<u8, 7>(&peek1).await + 11;
+                            actual_huff_code_i += rep as usize;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+
+                if actual_huff_code_i != (hlit + hdist as u16) as usize {
+                    return Err(DecompressError::InvalidCodeLenRep);
+                }
+
+                let (literal_code_lens, dist_code_lens) =
+                    actual_huff_code_lens.split_at(hlit as usize);
+                let dist_code_lens = &dist_code_lens[..hdist as usize];
+
+                lit_decoder.init(literal_code_lens)?;
+                if !(hdist == 1 && dist_code_lens[0] == 0) {
+                    dist_decoder.init(dist_code_lens)?;
+                }
+            }
+
+            while !outp.is_at_limit() {
+                let litsym = lit_decoder.read_sym_2(&mut bitbuf, &peek1).await?.into();
+                match litsym {
+                    0..=0xff => {
+                        outp.add_lits(&[litsym as u8]);
+                    }
+                    257..=285 => {
+                        let len_extra_nbits = LEN_EXTRA_BITS[litsym - 257];
+                        let len_extra = bitbuf
+                            .get_bits_as_num_dyn::<u16>(len_extra_nbits as usize, &peek1)
+                            .await;
+                        let len = LEN_FOR_SYM[litsym - 257] + len_extra;
+
+                        let distsym: usize =
+                            dist_decoder.read_sym_2(&mut bitbuf, &peek1).await?.into();
+                        if distsym > 29 {
+                            return Err(DecompressError::BadHuffSym);
+                        }
+                        let dist_extra_nbits = DIST_EXTRA_BITS[distsym];
+                        let dist_extra = bitbuf
+                            .get_bits_as_num_dyn::<u16>(dist_extra_nbits as usize, &peek1)
+                            .await;
+                        let dist = DIST_FOR_SYM[distsym] + dist_extra;
+
+                        outp.add_match(dist as usize - 1, len as usize)
+                            .map_err(|_| DecompressError::BadLookback {
+                                disp: dist,
+                                avail: outp.cur_pos() as u16,
+                            })?;
+                    }
+                    256 => {
+                        break;
+                    }
+                    _ => return Err(DecompressError::BadHuffSym),
+                }
+            }
+        }
+
+        if bfinal != 0 {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+pub type Decompress<'a, F> = StreamingDecompressState<'a, F, DecompressError, 2>;
+pub type DecompressBuffer<O> = StreamingOutputBuf<O, LOOKBACK_SZ>;
 
 #[inline]
 fn get_bits_num<T: funty::Integral, const N: usize>(
@@ -216,6 +461,35 @@ impl<
             || self.lookup[cur_code as usize].nbits() as usize != cur_code_len
         {
             let nextbit: u8 = get_bits_num::<u8, 1>(inp)?;
+            let cur_code_v = cur_code.view_bits_mut::<Msb0>();
+            cur_code_v.set(16 - MAX_LEN + cur_code_len, nextbit != 0);
+            cur_code_len += 1;
+        }
+
+        let sym = self.lookup[cur_code as usize];
+        debug_assert!(sym != SymTy::default());
+        Ok(sym)
+    }
+
+    async fn read_sym_2(
+        &self,
+        bb: &mut BitBuf,
+        peek1: &InputPeeker<'_, '_, 2, 1>,
+    ) -> Result<SymTy, DecompressError> {
+        let min_code = bb
+            .get_bits_as_num_dyn::<u16>(self.min_code_len, peek1)
+            .await;
+        let min_code = &min_code.view_bits::<Lsb0>()[..self.min_code_len];
+        let mut cur_code = 0u16;
+        let cur_code_v = cur_code.view_bits_mut::<Msb0>();
+        cur_code_v[(16 - MAX_LEN)..(16 - MAX_LEN + self.min_code_len)]
+            .clone_from_bitslice(&min_code);
+        let mut cur_code_len = self.min_code_len;
+
+        while self.lookup[cur_code as usize] == SymTy::default()
+            || self.lookup[cur_code as usize].nbits() as usize != cur_code_len
+        {
+            let nextbit = bb.get_bits_as_num::<u8, 1>(peek1).await;
             let cur_code_v = cur_code.view_bits_mut::<Msb0>();
             cur_code_v.set(16 - MAX_LEN + cur_code_len, nextbit != 0);
             cur_code_len += 1;
@@ -400,223 +674,6 @@ impl Into<usize> for LitSym {
 impl SymTyTrait for LitSym {
     fn nbits(&self) -> u8 {
         self.0.view_bits::<Msb0>()[..4].load()
-    }
-}
-
-#[derive(Clone)]
-pub struct DecompressBuffered {
-    coded_lengths_decoder: CanonicalHuffmanDecoder<CodedLenSym, 19, 7, 8, 128>,
-    lit_decoder: CanonicalHuffmanDecoder<LitSym, 288, 15, 16, { 1 << 15 }>,
-    dist_decoder: CanonicalHuffmanDecoder<DistSym, 30, 15, 16, { 1 << 15 }>,
-}
-
-impl DecompressBuffered {
-    pub fn new() -> Self {
-        Self {
-            coded_lengths_decoder: CanonicalHuffmanDecoder::new(),
-            lit_decoder: CanonicalHuffmanDecoder::new(),
-            dist_decoder: CanonicalHuffmanDecoder::new(),
-        }
-    }
-    #[cfg(feature = "alloc")]
-    pub fn new_boxed() -> Box<Self> {
-        unsafe {
-            let layout = core::alloc::Layout::new::<Self>();
-            let p = alloc::alloc(layout) as *mut Self;
-            CanonicalHuffmanDecoder::initialize_at(core::ptr::addr_of_mut!(
-                (*p).coded_lengths_decoder
-            ));
-            let p = alloc::alloc(layout) as *mut Self;
-            CanonicalHuffmanDecoder::initialize_at(core::ptr::addr_of_mut!((*p).lit_decoder));
-            let p = alloc::alloc(layout) as *mut Self;
-            CanonicalHuffmanDecoder::initialize_at(core::ptr::addr_of_mut!((*p).dist_decoder));
-            Box::from_raw(p)
-        }
-    }
-
-    fn decompress<B>(&mut self, inp: &[u8], outp: &mut B) -> Result<(), DecompressError>
-    where
-        B: MaybeGrowableBuf,
-    {
-        let mut inp = inp.view_bits::<Lsb0>();
-
-        loop {
-            let bfinal = get_bits_num::<u8, 1>(&mut inp)?;
-            let btype = get_bits_num::<u8, 2>(&mut inp)?;
-
-            if btype == 3 {
-                return Err(DecompressError::InvalidBlockType);
-            } else if btype == 0 {
-                let leftover_bits = inp.len() % 8;
-                let _ = get_bits_slice(&mut inp, leftover_bits);
-
-                // xxx efficiency???
-                let len = get_bits_num::<u16, 16>(&mut inp)?;
-                let nlen = get_bits_num::<u16, 16>(&mut inp)?;
-                if len != !nlen {
-                    return Err(DecompressError::BadNLen { len, nlen });
-                }
-
-                for _ in 0..len {
-                    let b = get_bits_num::<u8, 8>(&mut inp)?;
-                    outp.add_lit(b);
-                }
-            } else {
-                self.lit_decoder.reset();
-                self.dist_decoder.reset();
-
-                if btype == 1 {
-                    let mut lit_lens = [0; 288];
-                    for i in 0..=143 {
-                        lit_lens[i] = 8;
-                    }
-                    for i in 144..=255 {
-                        lit_lens[i] = 9;
-                    }
-                    for i in 256..=279 {
-                        lit_lens[i] = 7;
-                    }
-                    for i in 280..=287 {
-                        lit_lens[i] = 8;
-                    }
-                    self.lit_decoder.init(&lit_lens).unwrap();
-                    self.dist_decoder.init(&[5; 30]).unwrap();
-                } else {
-                    let hlit = get_bits_num::<u16, 5>(&mut inp)? + 257;
-                    let hdist = get_bits_num::<u8, 5>(&mut inp)? + 1;
-                    let hclen = get_bits_num::<u8, 4>(&mut inp)? + 4;
-                    if hlit > 286 {
-                        return Err(DecompressError::InvalidHLit);
-                    }
-                    if hdist > 30 {
-                        return Err(DecompressError::InvalidHDist);
-                    }
-
-                    let mut code_len_lens = [0; CODE_LEN_ALPHABET_SIZE];
-                    for i in 0..hclen {
-                        let l = get_bits_num::<u8, 3>(&mut inp)?;
-                        let idx = CODE_LEN_ORDER[i as usize];
-                        code_len_lens[idx as usize] = l;
-                    }
-
-                    self.coded_lengths_decoder.init(&code_len_lens)?;
-
-                    let mut actual_huff_code_lens = [0u8; 286 + 32];
-                    let mut actual_huff_code_i = 0;
-                    while actual_huff_code_i < (hlit + hdist as u16) as usize {
-                        let code_len_sym = self.coded_lengths_decoder.read_sym(&mut inp)?.into();
-
-                        match code_len_sym {
-                            0..=15 => {
-                                actual_huff_code_lens[actual_huff_code_i] = code_len_sym as u8;
-                                actual_huff_code_i += 1;
-                            }
-                            16 => {
-                                let rep = get_bits_num::<u8, 2>(&mut inp)? + 3;
-                                if actual_huff_code_i == 0 {
-                                    return Err(DecompressError::InvalidCodeLenRep);
-                                }
-                                let to_rep = actual_huff_code_lens[actual_huff_code_i - 1];
-                                if actual_huff_code_i + rep as usize
-                                    > (hlit + hdist as u16) as usize
-                                {
-                                    return Err(DecompressError::InvalidCodeLenRep);
-                                }
-
-                                for i in 0..rep as usize {
-                                    actual_huff_code_lens[actual_huff_code_i + i] = to_rep;
-                                }
-                                actual_huff_code_i += rep as usize;
-                            }
-                            17 => {
-                                let rep = get_bits_num::<u8, 3>(&mut inp)? + 3;
-                                actual_huff_code_i += rep as usize;
-                            }
-                            18 => {
-                                let rep = get_bits_num::<u8, 7>(&mut inp)? + 11;
-                                actual_huff_code_i += rep as usize;
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-
-                    if actual_huff_code_i != (hlit + hdist as u16) as usize {
-                        return Err(DecompressError::InvalidCodeLenRep);
-                    }
-
-                    let (literal_code_lens, dist_code_lens) =
-                        actual_huff_code_lens.split_at(hlit as usize);
-                    let dist_code_lens = &dist_code_lens[..hdist as usize];
-
-                    self.lit_decoder.init(literal_code_lens)?;
-                    if !(hdist == 1 && dist_code_lens[0] == 0) {
-                        self.dist_decoder.init(dist_code_lens)?;
-                    }
-                }
-
-                loop {
-                    let litsym: usize = self.lit_decoder.read_sym(&mut inp)?.into();
-                    match litsym {
-                        0..=0xff => {
-                            outp.add_lit(litsym as u8);
-                        }
-                        257..=285 => {
-                            let len_extra_nbits = LEN_EXTRA_BITS[litsym - 257];
-                            let len_extra = if len_extra_nbits > 0 {
-                                get_bits_num_dyn::<u16>(&mut inp, len_extra_nbits as usize)?
-                            } else {
-                                0
-                            };
-                            let len = LEN_FOR_SYM[litsym - 257] + len_extra;
-
-                            let distsym: usize = self.dist_decoder.read_sym(&mut inp)?.into();
-                            if distsym > 29 {
-                                return Err(DecompressError::BadHuffSym);
-                            }
-                            let dist_extra_nbits = DIST_EXTRA_BITS[distsym];
-                            let dist_extra = if dist_extra_nbits > 0 {
-                                get_bits_num_dyn::<u16>(&mut inp, dist_extra_nbits as usize)?
-                            } else {
-                                0
-                            };
-                            let dist = DIST_FOR_SYM[distsym] + dist_extra;
-
-                            outp.add_match(dist as usize, len as usize).map_err(|_| {
-                                DecompressError::BadLookback {
-                                    disp: dist,
-                                    avail: outp.cur_pos() as u16,
-                                }
-                            })?;
-                        }
-                        256 => {
-                            break;
-                        }
-                        _ => return Err(DecompressError::BadHuffSym),
-                    }
-                }
-            }
-
-            if bfinal != 0 {
-                break;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn decompress_into(&mut self, inp: &[u8], outp: &mut [u8]) -> Result<(), DecompressError> {
-        self.decompress(inp, &mut FixedBuf::from(outp))
-    }
-
-    #[cfg(feature = "alloc")]
-    pub fn decompress_new(
-        &mut self,
-        inp: &[u8],
-        max_sz: usize,
-    ) -> Result<Vec<u8>, DecompressError> {
-        let mut buf = VecBuf::new(0, max_sz);
-        self.decompress(inp, &mut buf)?;
-        Ok(buf.into())
     }
 }
 
@@ -1254,10 +1311,14 @@ mod tests {
         let inp = std::fs::read(inp_fn).unwrap();
         let ref_ = std::fs::read(ref_fn).unwrap();
 
-        let mut dec = DecompressBuffered::new();
-        let out = dec.decompress_new(&inp, usize::MAX).unwrap();
-
-        assert_eq!(out, ref_);
+        let mut outp = crate::decompress::VecBuf::new(0, ref_.len());
+        {
+            decompress_make!(dec, &mut outp, crate);
+            let ret = dec.add_inp(&inp);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let outvec: Vec<_> = outp.into();
+        assert_eq!(outvec, ref_);
     }
 
     #[test]
@@ -1270,10 +1331,14 @@ mod tests {
         let inp = std::fs::read(inp_fn).unwrap();
         let ref_ = std::fs::read(ref_fn).unwrap();
 
-        let mut dec = DecompressBuffered::new();
-        let out = dec.decompress_new(&inp, usize::MAX).unwrap();
-
-        assert_eq!(out, ref_);
+        let mut outp = crate::decompress::VecBuf::new(0, ref_.len());
+        {
+            decompress_make!(dec, &mut outp, crate);
+            let ret = dec.add_inp(&inp);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let outvec: Vec<_> = outp.into();
+        assert_eq!(outvec, ref_);
     }
 
     #[test]
@@ -1286,10 +1351,14 @@ mod tests {
         let inp = std::fs::read(inp_fn).unwrap();
         let ref_ = std::fs::read(ref_fn).unwrap();
 
-        let mut dec = DecompressBuffered::new();
-        let out = dec.decompress_new(&inp, usize::MAX).unwrap();
-
-        assert_eq!(out, ref_);
+        let mut outp = crate::decompress::VecBuf::new(0, ref_.len());
+        {
+            decompress_make!(dec, &mut outp, crate);
+            let ret = dec.add_inp(&inp);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let outvec: Vec<_> = outp.into();
+        assert_eq!(outvec, ref_);
     }
 
     #[test]
@@ -1298,8 +1367,13 @@ mod tests {
         let mut compressed_out = Vec::new();
         comp.compress(&[], true, |x| compressed_out.push(x));
 
-        let mut dec = DecompressBuffered::new();
-        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        let mut outp = crate::decompress::VecBuf::new(0, 0);
+        {
+            decompress_make!(dec, &mut outp, crate);
+            let ret = dec.add_inp(&compressed_out);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(decompress_ourselves, []);
     }
 
@@ -1323,9 +1397,14 @@ mod tests {
         outp_f.write(&compressed_out).unwrap();
         drop(outp_f);
 
-        let mut dec = DecompressBuffered::new();
-        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
-        assert_eq!(inp, decompress_ourselves);
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
+        {
+            decompress_make!(dec, &mut outp, crate);
+            let ret = dec.add_inp(&compressed_out);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let decompress_ourselves: Vec<_> = outp.into();
+        assert_eq!(decompress_ourselves, inp);
 
         let ref_fn = d.join("deflate-roundtrip-bytewise.out");
         Command::new("./deflatetest/tool")
@@ -1355,9 +1434,14 @@ mod tests {
         outp_f.write(&compressed_out).unwrap();
         drop(outp_f);
 
-        let mut dec = DecompressBuffered::new();
-        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
-        assert_eq!(inp, decompress_ourselves);
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
+        {
+            decompress_make!(dec, &mut outp, crate);
+            let ret = dec.add_inp(&compressed_out);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let decompress_ourselves: Vec<_> = outp.into();
+        assert_eq!(decompress_ourselves, inp);
 
         let ref_fn = d.join("deflate-roundtrip-wholefile.out");
         Command::new("./deflatetest/tool")

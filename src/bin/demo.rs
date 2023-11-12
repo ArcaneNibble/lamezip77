@@ -111,8 +111,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 outp = outvec.into();
             }
             Some("deflate") => {
-                let mut dec = deflate::DecompressBuffered::new();
-                outp = dec.decompress_new(&inp, usize::MAX)?;
+                let mut outvec = VecBuf::new(0, usize::MAX);
+                {
+                    lamezip77::deflate::decompress_make!(dec, &mut outvec);
+                    let ret = dec.add_inp(&inp)?;
+                    assert_eq!(ret, 0);
+                }
+                outp = outvec.into();
             }
             _ => {
                 println!("Invalid format {}", format.to_string_lossy());
