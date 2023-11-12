@@ -7,28 +7,12 @@ use std::error::Error;
 #[cfg(feature = "alloc")]
 extern crate alloc as alloc_crate;
 #[cfg(feature = "alloc")]
-use alloc_crate::{alloc, boxed::Box, vec::Vec};
+use alloc_crate::{alloc, boxed::Box};
 
-use crate::{util::*, LZEngine, LZOutput, LZSettings};
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum DecompressState {
-    Token,
-    MoreLitLen,
-    LiteralRun,
-    Offset0,
-    Offset1,
-    MoreMatchLen,
-}
-
-impl DecompressState {
-    const fn is_at_boundary(&self) -> bool {
-        match self {
-            DecompressState::Token | DecompressState::Offset0 => true,
-            _ => false,
-        }
-    }
-}
+use crate::{
+    decompress::{InputPeeker, LZOutputBuf, StreamingDecompressState, StreamingOutputBuf},
+    LZEngine, LZOutput, LZSettings,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecompressError {
@@ -58,235 +42,73 @@ impl Error for DecompressError {}
 
 const LOOKBACK_SZ: usize = 65535;
 
-// technically copy-able, but don't want to make it easy to accidentally do so
-#[derive(Clone)]
-pub struct DecompressStreaming {
-    lookback: [u8; LOOKBACK_SZ],
-    lookback_wptr: usize,
-    lookback_avail: usize,
-    state: DecompressState,
-    nlit: usize,
-    offset: u16,
-    matchlen: usize,
-}
+pub use lamezip77_macros::lz4_decompress_make as decompress_make;
 
-impl DecompressStreaming {
-    pub fn new() -> Self {
-        Self {
-            lookback: [0; LOOKBACK_SZ],
-            lookback_wptr: 0,
-            lookback_avail: 0,
-            state: DecompressState::Token,
-            nlit: 0,
-            offset: 0,
-            matchlen: 0,
-        }
-    }
-    #[cfg(feature = "alloc")]
-    pub fn new_boxed() -> Box<Self> {
-        unsafe {
-            let layout = core::alloc::Layout::new::<Self>();
-            let p = alloc::alloc(layout) as *mut Self;
-            let p_lookback = core::ptr::addr_of_mut!((*p).lookback);
-            for i in 0..LOOKBACK_SZ {
-                // my understanding is that this is safe because u64 doesn't have Drop
-                // and we don't construct a & anywhere
-                (*p_lookback)[i] = 0;
+pub async fn decompress_impl<O>(
+    outp: &mut O,
+    peek1: InputPeeker<'_, '_, 2, 1>,
+    peek2: InputPeeker<'_, '_, 2, 2>,
+) -> Result<(), DecompressError>
+where
+    O: LZOutputBuf,
+{
+    while !outp.is_at_limit() {
+        let token = (&peek1).await[0];
+        let token = token.view_bits::<Msb0>();
+
+        let mut nlits = token[..4].load::<usize>();
+        if nlits == 15 {
+            loop {
+                let b = (&peek1).await[0];
+                nlits += b as usize;
+                if b != 0xff {
+                    break;
+                }
             }
-            (*p).lookback_wptr = 0;
-            (*p).lookback_avail = 0;
-            (*p).state = DecompressState::Token;
-            (*p).nlit = 0;
-            (*p).offset = 0;
-            (*p).matchlen = 0;
-            Box::from_raw(p)
         }
-    }
 
-    fn do_match<O>(&mut self, mut outp: O) -> Result<(), DecompressError>
-    where
-        O: FnMut(u8),
-    {
-        if self.offset == 0 {
+        for _ in 0..nlits {
+            outp.add_lits(&(&peek1).await);
+        }
+
+        if outp.is_at_limit() {
+            // last block terminates here without offset
+            break;
+        }
+
+        let offset = u16::from_le_bytes((&peek2).await);
+
+        let mut matchlen = token[4..].load::<usize>() + 4;
+        if matchlen == 19 {
+            loop {
+                let b = (&peek1).await[0];
+                matchlen += b as usize;
+                if b != 0xff {
+                    break;
+                }
+            }
+        }
+
+        if offset == 0 {
             return Err(DecompressError::BadLookback {
-                disp: self.offset,
+                disp: offset as u16,
                 avail: 0,
             });
         }
-        if self.offset as usize > self.lookback_avail {
-            return Err(DecompressError::BadLookback {
-                disp: self.offset,
-                avail: self.lookback_avail as u16,
-            });
-        }
 
-        for _ in 0..self.matchlen {
-            let idx = (self.lookback_wptr + LOOKBACK_SZ - self.offset as usize) % LOOKBACK_SZ;
-            let copy_b = self.lookback[idx];
-            outp(copy_b);
-            self.lookback[self.lookback_wptr] = copy_b;
-            self.lookback_wptr = (self.lookback_wptr + 1) % LOOKBACK_SZ;
-            if self.lookback_avail < LOOKBACK_SZ {
-                self.lookback_avail += 1;
+        outp.add_match(offset as usize - 1, matchlen).map_err(|_| {
+            DecompressError::BadLookback {
+                disp: offset as u16,
+                avail: outp.cur_pos() as u16,
             }
-        }
-
-        Ok(())
+        })?;
     }
 
-    pub fn decompress<O>(&mut self, mut inp: &[u8], mut outp: O) -> Result<bool, DecompressError>
-    where
-        O: FnMut(u8),
-    {
-        while inp.len() > 0 {
-            let b = get_inp::<1>(&mut inp).unwrap()[0];
-
-            match self.state {
-                DecompressState::Token => {
-                    let token = b.view_bits::<Msb0>();
-                    let nlit = token[..4].load::<usize>();
-                    let matchlen = token[4..].load::<usize>();
-
-                    self.nlit = nlit;
-                    self.matchlen = matchlen + 4;
-
-                    if nlit == 15 {
-                        self.state = DecompressState::MoreLitLen;
-                    } else if nlit != 0 {
-                        self.state = DecompressState::LiteralRun;
-                    } else {
-                        self.state = DecompressState::Offset0;
-                    }
-                }
-                DecompressState::MoreLitLen => {
-                    self.nlit += b as usize;
-                    if b != 0xFF {
-                        self.state = DecompressState::LiteralRun;
-                    }
-                }
-                DecompressState::LiteralRun => {
-                    outp(b);
-                    self.lookback[self.lookback_wptr] = b;
-                    self.lookback_wptr = (self.lookback_wptr + 1) % LOOKBACK_SZ;
-                    if self.lookback_avail < LOOKBACK_SZ {
-                        self.lookback_avail += 1;
-                    }
-
-                    self.nlit -= 1;
-                    if self.nlit == 0 {
-                        self.state = DecompressState::Offset0;
-                    }
-                }
-                DecompressState::Offset0 => {
-                    self.offset = b as u16;
-                    self.state = DecompressState::Offset1;
-                }
-                DecompressState::Offset1 => {
-                    self.offset |= (b as u16) << 8;
-                    if self.matchlen == 19 {
-                        self.state = DecompressState::MoreMatchLen
-                    } else {
-                        self.do_match(&mut outp)?;
-                        self.state = DecompressState::Token;
-                    }
-                }
-                DecompressState::MoreMatchLen => {
-                    self.matchlen += b as usize;
-                    if b != 0xFF {
-                        self.do_match(&mut outp)?;
-                        self.state = DecompressState::Token;
-                    }
-                }
-            }
-        }
-
-        Ok(self.state.is_at_boundary())
-    }
+    Ok(())
 }
 
-#[derive(Copy, Clone)]
-pub struct DecompressBuffered {}
-
-impl DecompressBuffered {
-    pub fn new() -> Self {
-        Self {}
-    }
-
-    fn decompress<B>(&self, mut inp: &[u8], outp: &mut B) -> Result<(), DecompressError>
-    where
-        B: MaybeGrowableBuf,
-    {
-        while inp.len() > 0 {
-            let token = get_inp::<1>(&mut inp).unwrap()[0];
-            let token = token.view_bits::<Msb0>();
-
-            let mut nlits = token[..4].load::<usize>();
-            if nlits == 15 {
-                loop {
-                    let b = get_inp::<1>(&mut inp).map_err(|_| DecompressError::Truncated)?[0];
-                    nlits += b as usize;
-                    if b != 0xff {
-                        break;
-                    }
-                }
-            }
-
-            for _ in 0..nlits {
-                // XXX efficiency?
-                if outp.cur_pos() < outp.limit() {
-                    outp.add_lit(
-                        get_inp::<1>(&mut inp).map_err(|_| DecompressError::Truncated)?[0],
-                    );
-                }
-            }
-
-            if inp.len() == 0 {
-                // last block terminates here without offset
-                break;
-            }
-
-            let offset =
-                u16::from_le_bytes(get_inp::<2>(&mut inp).map_err(|_| DecompressError::Truncated)?);
-
-            let mut matchlen = token[4..].load::<usize>() + 4;
-            if matchlen == 19 {
-                loop {
-                    let b = get_inp::<1>(&mut inp).map_err(|_| DecompressError::Truncated)?[0];
-                    matchlen += b as usize;
-                    if b != 0xff {
-                        break;
-                    }
-                }
-            }
-
-            if offset == 0 {
-                return Err(DecompressError::BadLookback {
-                    disp: offset as u16,
-                    avail: 0,
-                });
-            }
-
-            outp.add_match(offset as usize, matchlen).map_err(|_| {
-                DecompressError::BadLookback {
-                    disp: offset as u16,
-                    avail: outp.cur_pos() as u16,
-                }
-            })?;
-        }
-        Ok(())
-    }
-
-    pub fn decompress_into(&self, inp: &[u8], outp: &mut [u8]) -> Result<(), DecompressError> {
-        self.decompress(inp, &mut FixedBuf::from(outp))
-    }
-
-    #[cfg(feature = "alloc")]
-    pub fn decompress_new(&self, inp: &[u8], max_sz: usize) -> Result<Vec<u8>, DecompressError> {
-        let mut buf = VecBuf::new(0, max_sz);
-        self.decompress(inp, &mut buf)?;
-        Ok(buf.into())
-    }
-}
+pub type Decompress<'a, F> = StreamingDecompressState<'a, F, DecompressError, 2>;
+pub type DecompressBuffer<O> = StreamingOutputBuf<O, LOOKBACK_SZ>;
 
 pub struct Compress<const MAX_LIT_BUF: usize> {
     engine: LZEngine<
@@ -447,10 +269,14 @@ mod tests {
         let inp = std::fs::read(inp_fn).unwrap();
         let ref_ = std::fs::read(ref_fn).unwrap();
 
-        let dec = DecompressBuffered::new();
-        let out = dec.decompress_new(&inp, usize::MAX).unwrap();
-
-        assert_eq!(out, ref_);
+        let mut outp = crate::decompress::VecBuf::new(0, ref_.len());
+        {
+            decompress_make!(dec, &mut outp, crate);
+            let ret = dec.add_inp(&inp);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let outvec: Vec<_> = outp.into();
+        assert_eq!(outvec, ref_);
     }
 
     #[test]
@@ -463,11 +289,17 @@ mod tests {
         let inp = std::fs::read(inp_fn).unwrap();
         let ref_ = std::fs::read(ref_fn).unwrap();
 
-        let mut dec = DecompressStreaming::new_boxed();
         let mut out = Vec::new();
+        {
+            let mut outp = DecompressBuffer::new(|x| out.extend_from_slice(x), ref_.len());
+            decompress_make!(dec, &mut outp, crate);
 
-        for b in inp {
-            dec.decompress(&[b], |x| out.push(x)).unwrap();
+            let mut ret = Ok(usize::MAX);
+            for b in inp {
+                ret = dec.add_inp(&[b]);
+                assert!(ret.is_ok());
+            }
+            assert!(ret.unwrap() == 0);
         }
 
         assert_eq!(out, ref_);
@@ -482,8 +314,13 @@ mod tests {
 
         assert_eq!(compressed_out, [0x00]);
 
-        let dec = DecompressBuffered::new();
-        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        let mut outp = crate::decompress::VecBuf::new(0, 0);
+        {
+            decompress_make!(dec, &mut outp, crate);
+            let ret = dec.add_inp(&compressed_out);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(decompress_ourselves, []);
     }
 
@@ -498,8 +335,13 @@ mod tests {
 
         assert_eq!(compressed_out, [0xC0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
-        let dec = DecompressBuffered::new();
-        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
+        {
+            decompress_make!(dec, &mut outp, crate);
+            let ret = dec.add_inp(&compressed_out);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(decompress_ourselves, inp);
     }
 
@@ -517,8 +359,13 @@ mod tests {
             [0xD0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12]
         );
 
-        let dec = DecompressBuffered::new();
-        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
+        {
+            decompress_make!(dec, &mut outp, crate);
+            let ret = dec.add_inp(&compressed_out);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(decompress_ourselves, inp);
     }
 
@@ -543,8 +390,13 @@ mod tests {
         outp_f.write(&compressed_out).unwrap();
         drop(outp_f);
 
-        let dec = DecompressBuffered::new();
-        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
+        {
+            decompress_make!(dec, &mut outp, crate);
+            let ret = dec.add_inp(&compressed_out);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(decompress_ourselves, inp);
 
         let ref_fn = d.join("lz4-min.out");
@@ -580,8 +432,13 @@ mod tests {
         outp_f.write(&compressed_out).unwrap();
         drop(outp_f);
 
-        let dec = DecompressBuffered::new();
-        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
+        {
+            decompress_make!(dec, &mut outp, crate);
+            let ret = dec.add_inp(&compressed_out);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(inp, decompress_ourselves);
 
         let ref_fn = d.join("lz4-roundtrip-bytewise.out");
@@ -613,8 +470,13 @@ mod tests {
         outp_f.write(&compressed_out).unwrap();
         drop(outp_f);
 
-        let dec = DecompressBuffered::new();
-        let decompress_ourselves = dec.decompress_new(&compressed_out, usize::MAX).unwrap();
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
+        {
+            decompress_make!(dec, &mut outp, crate);
+            let ret = dec.add_inp(&compressed_out);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(inp, decompress_ourselves);
 
         let ref_fn = d.join("lz4-roundtrip-wholefile.out");

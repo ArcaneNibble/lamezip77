@@ -150,16 +150,6 @@ impl MaybeGrowableBuf for VecBuf {
     }
 }
 
-pub fn get_inp<const N: usize>(inp: &mut &[u8]) -> Result<[u8; N], ()> {
-    if inp.len() < N {
-        Err(())
-    } else {
-        let ret: [u8; N] = inp[..N].try_into().unwrap();
-        *inp = &inp[N..];
-        Ok(ret)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
