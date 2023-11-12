@@ -1,5 +1,7 @@
 #![no_std]
 
+mod decompress;
+
 mod sliding_window;
 
 mod hashtables;
