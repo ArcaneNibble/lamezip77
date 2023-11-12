@@ -1,9 +1,15 @@
+[workspace]
+members = ["lamezip77_macros"]
+
 [package]
 name = "lamezip77"
 version = "0.0.1"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies.lamezip77_macros]
+path = "lamezip77_macros"
 
 [dependencies.bitvec]
 version = "1"

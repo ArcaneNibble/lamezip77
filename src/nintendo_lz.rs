@@ -74,6 +74,8 @@ impl Error for DecompressError {}
 
 const LOOKBACK_SZ: usize = 0x1000;
 
+pub use lamezip77_macros::nintendo_lz_decompress_make as decompress_make;
+
 pub async fn decompress_impl<O>(
     mut outp: O,
     peek1: InputPeeker<'_, '_, 4, 1>,
@@ -479,15 +481,7 @@ mod tests {
         let mut outvec = Vec::new();
         {
             let outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x));
-
-            let innerstate = crate::decompress::StreamingDecompressInnerState::<4>::new();
-            let x = core::pin::pin!(decompress_impl(
-                outp,
-                innerstate.get_peeker::<1>(),
-                innerstate.get_peeker::<2>(),
-                innerstate.get_peeker::<4>(),
-            ));
-            let mut decomp = Decompress::new(&innerstate, x);
+            decompress_make!(decomp, crate);
 
             let ret = decomp.add_inp(&[0x10]);
             assert_eq!(ret, Ok(3));
