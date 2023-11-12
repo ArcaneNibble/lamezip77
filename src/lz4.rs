@@ -1,4 +1,3 @@
-use bitvec::prelude::*;
 #[cfg(feature = "std")]
 extern crate std;
 #[cfg(feature = "std")]
@@ -54,9 +53,8 @@ where
 {
     while !outp.is_at_limit() {
         let token = (&peek1).await[0];
-        let token = token.view_bits::<Msb0>();
 
-        let mut nlits = token[..4].load::<usize>();
+        let mut nlits = (token >> 4) as usize;
         if nlits == 15 {
             loop {
                 let b = (&peek1).await[0];
@@ -78,7 +76,7 @@ where
 
         let offset = u16::from_le_bytes((&peek2).await);
 
-        let mut matchlen = token[4..].load::<usize>() + 4;
+        let mut matchlen = ((token & 0b1111) as usize) + 4;
         if matchlen == 19 {
             loop {
                 let b = (&peek1).await[0];
@@ -173,17 +171,18 @@ impl<const MAX_LIT_BUF: usize> Compress<MAX_LIT_BUF> {
 
         macro_rules! dump_lits {
             ($match_len:expr) => {
-                let match_len_lsb = if $match_len < 15 { $match_len } else { 15 };
+                let match_len_lsb = if $match_len < 15 {
+                    $match_len as u8
+                } else {
+                    15
+                };
                 let nlit_lsb = if self.num_buffered_lits < 15 {
                     self.num_buffered_lits as u8
                 } else {
                     15
                 };
 
-                let mut token = 0u8;
-                let token_v = token.view_bits_mut::<Msb0>();
-                token_v[..4].store(nlit_lsb);
-                token_v[4..].store(match_len_lsb);
+                let token = nlit_lsb << 4 | match_len_lsb;
                 outp(token);
 
                 if self.num_buffered_lits >= 15 {

@@ -1,4 +1,3 @@
-use bitvec::prelude::*;
 #[cfg(feature = "std")]
 extern crate std;
 #[cfg(feature = "std")]
@@ -65,13 +64,12 @@ where
             } else {
                 (&peek1).await[0]
             };
-            let opc0 = opc0.view_bits::<Msb0>();
-            let opc_len = opc0[..3].load::<u8>();
+            let opc_len = opc0 >> 5;
 
             if is_first_opc || opc_len == 0 {
                 is_first_opc = false;
                 // literal run
-                let nlit = opc0[3..].load::<u8>() + 1;
+                let nlit = (opc0 & 0b11111) + 1;
                 for _ in 0..nlit {
                     outp.add_lits(&(&peek1).await);
                 }
@@ -84,7 +82,7 @@ where
                 };
 
                 let opc12 = (&peek1).await[0];
-                let matchdisp = (opc0[3..].load::<usize>() << 8) | (opc12 as usize);
+                let matchdisp = (((opc0 & 0b11111) as usize) << 8) | (opc12 as usize);
 
                 outp.add_match(matchdisp, matchlen)
                     .map_err(|_| DecompressError::BadLookback {
@@ -100,13 +98,12 @@ where
             } else {
                 (&peek1).await[0]
             };
-            let opc0 = opc0.view_bits::<Msb0>();
-            let opc_len = opc0[..3].load::<u8>();
+            let opc_len = opc0 >> 5;
 
             if is_first_opc || opc_len == 0 {
                 is_first_opc = false;
                 // literal run
-                let nlit = opc0[3..].load::<u8>() + 1;
+                let nlit = (opc0 & 0b11111) + 1;
                 for _ in 0..nlit {
                     outp.add_lits(&(&peek1).await);
                 }
@@ -123,7 +120,7 @@ where
                 }
 
                 let opc_dispnext = (&peek1).await[0];
-                let mut matchdisp = (opc0[3..].load::<usize>() << 8) | (opc_dispnext as usize);
+                let mut matchdisp = (((opc0 & 0b11111) as usize) << 8) | (opc_dispnext as usize);
                 if matchdisp == 0b11111_11111111 {
                     let moredisp = (&peek2).await;
                     let moredisp = ((moredisp[0] as usize) << 8) | (moredisp[1] as usize);
@@ -237,10 +234,7 @@ impl CompressLevel1 {
                             (len - 2) as u8
                         };
 
-                        let mut opc0 = 0u8;
-                        let opc0_v = opc0.view_bits_mut::<Msb0>();
-                        opc0_v[..3].store(len_opc0);
-                        opc0_v[3..].store(disp >> 8);
+                        let opc0 = len_opc0 << 5 | ((disp >> 8) as u8);
                         outp(opc0);
 
                         if len >= 0b111 + 2 {
@@ -367,10 +361,7 @@ impl CompressLevel2 {
                             (len - 2) as u8
                         };
 
-                        let mut opc0 = 0u8;
-                        let opc0_v = opc0.view_bits_mut::<Msb0>();
-                        opc0_v[..3].store(len_opc0);
-                        opc0_v[3..].store(disp_non_extra >> 8);
+                        let opc0 = len_opc0 << 5 | ((disp_non_extra >> 8) as u8);
                         outp(opc0);
 
                         // match len
