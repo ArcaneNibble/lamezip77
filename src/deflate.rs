@@ -403,14 +403,12 @@ impl<
         bb: &mut BitBuf,
         peek1: &InputPeeker<'_, '_, 2, 1>,
     ) -> Result<SymTy, DecompressError> {
-        let min_code = bb
+        let mut min_code = bb
             .get_bits_as_num_dyn::<u16>(self.min_code_len, peek1)
             .await;
-        let min_code = &min_code.view_bits::<Lsb0>()[..self.min_code_len];
-        let mut cur_code = 0u16;
-        let cur_code_v = cur_code.view_bits_mut::<Msb0>();
-        cur_code_v[(16 - MAX_LEN)..(16 - MAX_LEN + self.min_code_len)]
-            .clone_from_bitslice(&min_code);
+        min_code.view_bits_mut::<Lsb0>()[..self.min_code_len].reverse();
+
+        let mut cur_code = min_code << (MAX_LEN - self.min_code_len);
         let mut cur_code_len = self.min_code_len;
 
         while self.lookup[cur_code as usize] == SymTy::default()
