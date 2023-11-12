@@ -227,7 +227,7 @@ mod tests {
     fn nin_all_lits() {
         let mut outvec = Vec::new();
         {
-            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x));
+            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x), usize::MAX);
             decompress_make!(dec, &mut outp, crate);
 
             let ret = dec.add_inp(&[0x10]);
@@ -263,7 +263,7 @@ mod tests {
     fn nin_disp_repeating() {
         let mut outvec = Vec::new();
         {
-            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x));
+            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x), usize::MAX);
             decompress_make!(dec, &mut outp, crate);
 
             let ret = dec.add_inp(&[0x10, 11, 0, 0, 0b00100000, 0xaa, 0xbb, 0b0110_0000, 1]);
@@ -279,7 +279,7 @@ mod tests {
     fn nin_disp_repeating_overlong() {
         let mut outvec = Vec::new();
         {
-            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x));
+            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x), usize::MAX);
             decompress_make!(dec, &mut outp, crate);
 
             let ret = dec.add_inp(&[0x10, 11, 0, 0, 0b00100000, 0xaa, 0xbb, 0b1111_0000, 1]);
@@ -295,7 +295,7 @@ mod tests {
     fn nin_disp_non_repeating() {
         let mut outvec = Vec::new();
         {
-            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x));
+            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x), usize::MAX);
             decompress_make!(dec, &mut outp, crate);
 
             let ret = dec.add_inp(&[0x10, 9, 0, 0, 0b00001000, 1, 2, 3, 4, 0b0000_0000, 2, 5, 6]);
@@ -308,7 +308,7 @@ mod tests {
     fn nin_disp_invalid() {
         let mut outvec = Vec::new();
         {
-            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x));
+            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x), usize::MAX);
             decompress_make!(dec, &mut outp, crate);
 
             let ret = dec.add_inp(&[0x10, 9, 0, 0, 0b00001000, 1, 2, 3, 4, 0b0000_0000, 4, 5, 6]);

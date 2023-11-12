@@ -285,18 +285,20 @@ where
     buf: [u8; LOOKBACK_SZ],
     wptr: usize,
     cur_pos: usize,
+    limit: usize,
 }
 
 impl<O, const LOOKBACK_SZ: usize> StreamingOutputBuf<O, LOOKBACK_SZ>
 where
     O: FnMut(&[u8]),
 {
-    pub fn new(outp: O) -> Self {
+    pub fn new(outp: O, limit: usize) -> Self {
         Self {
             outp,
             buf: [0; LOOKBACK_SZ],
             wptr: 0,
             cur_pos: 0,
+            limit,
         }
     }
     #[cfg(feature = "alloc")]
@@ -365,7 +367,7 @@ where
     }
 
     fn is_at_limit(&self) -> bool {
-        false
+        self.cur_pos == self.limit
     }
 }
 
@@ -442,7 +444,7 @@ mod tests {
     #[test]
     fn decompress_stream_buf() {
         let mut xbuf = Vec::new();
-        let mut buf = StreamingOutputBuf::<_, 4>::new(|x| xbuf.extend_from_slice(x));
+        let mut buf = StreamingOutputBuf::<_, 4>::new(|x| xbuf.extend_from_slice(x), usize::MAX);
 
         buf.add_lits(&[0x11]);
         assert_eq!(buf.buf, [0x11, 0, 0, 0]);
@@ -469,7 +471,7 @@ mod tests {
     #[test]
     fn decompress_stream_buf_match() {
         let mut xbuf = Vec::new();
-        let mut buf = StreamingOutputBuf::<_, 4>::new(|x| xbuf.extend_from_slice(x));
+        let mut buf = StreamingOutputBuf::<_, 4>::new(|x| xbuf.extend_from_slice(x), usize::MAX);
 
         buf.add_lits(&[0x11, 0x22, 0x33]);
 
