@@ -7,45 +7,18 @@ use std::error::Error;
 #[cfg(feature = "alloc")]
 extern crate alloc as alloc_crate;
 #[cfg(feature = "alloc")]
-use alloc_crate::{alloc, boxed::Box, vec::Vec};
+use alloc_crate::{alloc, boxed::Box};
 
 use crate::decompress::StreamingOutputBuf;
-use crate::util::*;
 use crate::{
     decompress::{InputPeeker, LZOutputBuf, StreamingDecompressState},
     LZEngine, LZOutput, LZSettings,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum DecompressState {
-    HdrMagic,
-    HdrLen0,
-    HdrLen1,
-    HdrLen2,
-    BlockFlags,
-    BlockData0,
-    BlockData1,
-}
-
-impl DecompressState {
-    const fn is_header_state(&self) -> bool {
-        match self {
-            DecompressState::HdrMagic
-            | DecompressState::HdrLen0
-            | DecompressState::HdrLen1
-            | DecompressState::HdrLen2 => true,
-            DecompressState::BlockFlags
-            | DecompressState::BlockData0
-            | DecompressState::BlockData1 => false,
-        }
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecompressError {
     BadMagic(u8),
     BadLookback { disp: u16, avail: u16 },
-    TooShort,
 }
 
 impl core::fmt::Display for DecompressError {
@@ -62,9 +35,6 @@ impl core::fmt::Display for DecompressError {
                     avail
                 )
             }
-            DecompressError::TooShort => {
-                write!(f, "Too little data available")
-            }
         }
     }
 }
@@ -77,7 +47,7 @@ const LOOKBACK_SZ: usize = 0x1000;
 pub use lamezip77_macros::nintendo_lz_decompress_make as decompress_make;
 
 pub async fn decompress_impl<O>(
-    mut outp: O,
+    outp: &mut O,
     peek1: InputPeeker<'_, '_, 4, 1>,
     peek2: InputPeeker<'_, '_, 4, 2>,
     peek4: InputPeeker<'_, '_, 4, 4>,
@@ -108,9 +78,11 @@ where
                 let matchb = (&peek2).await;
                 let matchb = matchb.view_bits::<Msb0>();
                 let disp = matchb[4..].load_be::<usize>();
-                let len = matchb[..4].load_be::<usize>();
+                let len = matchb[..4].load_be::<usize>() + 3;
 
-                outp.add_match(disp + 1, len + 3)
+                let len = core::cmp::min(len, encoded_len - outp.cur_pos());
+
+                outp.add_match(disp, len)
                     .map_err(|_| DecompressError::BadLookback {
                         disp: disp as u16,
                         avail: outp.cur_pos() as u16,
@@ -124,231 +96,6 @@ where
 
 pub type Decompress<'a, F> = StreamingDecompressState<'a, F, DecompressError, 4>;
 pub type DecompressBuffer<O> = StreamingOutputBuf<O, LOOKBACK_SZ>;
-
-// technically copy-able, but don't want to make it easy to accidentally do so
-#[derive(Clone)]
-pub struct DecompressStreaming {
-    lookback: [u8; LOOKBACK_SZ],
-    lookback_wptr: usize,
-    lookback_avail: usize,
-    state: DecompressState,
-    remaining_bytes: u32,
-    block_flags: u8,
-    block_i: u8,
-    match_b0: u8,
-}
-
-impl DecompressStreaming {
-    pub fn new() -> Self {
-        Self {
-            lookback: [0; LOOKBACK_SZ],
-            lookback_wptr: 0,
-            lookback_avail: 0,
-            state: DecompressState::HdrMagic,
-            remaining_bytes: 0,
-            block_flags: 0,
-            block_i: 0,
-            match_b0: 0,
-        }
-    }
-    #[cfg(feature = "alloc")]
-    pub fn new_boxed() -> Box<Self> {
-        unsafe {
-            let layout = core::alloc::Layout::new::<Self>();
-            let p = alloc::alloc(layout) as *mut Self;
-            let p_lookback = core::ptr::addr_of_mut!((*p).lookback);
-            for i in 0..LOOKBACK_SZ {
-                // my understanding is that this is safe because u64 doesn't have Drop
-                // and we don't construct a & anywhere
-                (*p_lookback)[i] = 0;
-            }
-            (*p).lookback_wptr = 0;
-            (*p).lookback_avail = 0;
-            (*p).state = DecompressState::HdrMagic;
-            (*p).remaining_bytes = 0;
-            (*p).block_flags = 0;
-            (*p).block_i = 0;
-            (*p).match_b0 = 0;
-            Box::from_raw(p)
-        }
-    }
-
-    pub fn manually_set_len(&mut self, len: u32) {
-        assert!(self.state == DecompressState::HdrMagic);
-        self.state = DecompressState::BlockFlags;
-        self.remaining_bytes = len;
-    }
-
-    const fn need_more_bytes(&self) -> bool {
-        self.state.is_header_state() || self.remaining_bytes > 0
-    }
-
-    pub fn decompress<O>(&mut self, mut inp: &[u8], mut outp: O) -> Result<bool, DecompressError>
-    where
-        O: FnMut(u8),
-    {
-        while inp.len() > 0 && self.need_more_bytes() {
-            let b = get_inp::<1>(&mut inp).unwrap()[0];
-
-            match self.state {
-                DecompressState::HdrMagic => {
-                    if b != 0x10 {
-                        return Err(DecompressError::BadMagic(b));
-                    }
-                    self.state = DecompressState::HdrLen0;
-                }
-                DecompressState::HdrLen0 => {
-                    self.remaining_bytes = b as u32;
-                    self.state = DecompressState::HdrLen1;
-                }
-                DecompressState::HdrLen1 => {
-                    self.remaining_bytes = self.remaining_bytes | ((b as u32) << 8);
-                    self.state = DecompressState::HdrLen2;
-                }
-                DecompressState::HdrLen2 => {
-                    self.remaining_bytes = self.remaining_bytes | ((b as u32) << 16);
-                    self.state = DecompressState::BlockFlags;
-                }
-                DecompressState::BlockFlags => {
-                    self.block_flags = b;
-                    self.block_i = 0;
-                    self.state = DecompressState::BlockData0;
-                }
-                DecompressState::BlockData0 => {
-                    let flags = self.block_flags.view_bits::<Msb0>();
-                    if flags[self.block_i as usize] == false {
-                        let lit = b;
-                        outp(lit);
-                        self.remaining_bytes -= 1;
-                        self.lookback[self.lookback_wptr] = lit;
-                        self.lookback_wptr = (self.lookback_wptr + 1) % LOOKBACK_SZ;
-                        if self.lookback_avail < LOOKBACK_SZ {
-                            self.lookback_avail += 1;
-                        }
-
-                        self.block_i += 1;
-                        if self.block_i == 8 {
-                            self.state = DecompressState::BlockFlags;
-                        }
-                    } else {
-                        self.match_b0 = b;
-                        self.state = DecompressState::BlockData1;
-                    }
-                }
-                DecompressState::BlockData1 => {
-                    let matchb = [self.match_b0, b];
-                    let matchb = matchb.view_bits::<Msb0>();
-
-                    let disp = matchb[4..].load_be::<usize>();
-                    let len = matchb[..4].load_be::<usize>();
-
-                    if disp + 1 > self.lookback_avail {
-                        return Err(DecompressError::BadLookback {
-                            disp: disp as u16,
-                            avail: self.lookback_avail as u16,
-                        });
-                    }
-
-                    for _ in 0..(len + 3) {
-                        if self.remaining_bytes == 0 {
-                            break;
-                        }
-
-                        let idx = (self.lookback_wptr + LOOKBACK_SZ - disp - 1) % LOOKBACK_SZ;
-                        let copy_b = self.lookback[idx];
-                        outp(copy_b);
-                        self.remaining_bytes -= 1;
-                        self.lookback[self.lookback_wptr] = copy_b;
-                        self.lookback_wptr = (self.lookback_wptr + 1) % LOOKBACK_SZ;
-                        if self.lookback_avail < LOOKBACK_SZ {
-                            self.lookback_avail += 1;
-                        }
-                    }
-
-                    self.block_i += 1;
-                    if self.block_i == 8 {
-                        self.state = DecompressState::BlockFlags;
-                    } else {
-                        self.state = DecompressState::BlockData0;
-                    }
-                }
-            }
-        }
-
-        Ok(!self.need_more_bytes())
-    }
-}
-
-#[derive(Copy, Clone)]
-pub struct DecompressBuffered {}
-
-impl DecompressBuffered {
-    pub fn new() -> Self {
-        Self {}
-    }
-
-    fn decompress<B>(&self, mut inp: &[u8], outp: &mut B) -> Result<(), DecompressError>
-    where
-        B: MaybeGrowableBuf,
-    {
-        let magic = get_inp::<4>(&mut inp).map_err(|_| DecompressError::TooShort)?;
-        if magic[0] != 0x10 {
-            return Err(DecompressError::BadMagic(magic[0]));
-        }
-        let encoded_len =
-            (magic[1] as usize) | ((magic[2] as usize) << 8) | ((magic[3] as usize) << 16);
-        let wanted_len = core::cmp::min(encoded_len, outp.limit());
-
-        while outp.cur_pos() < wanted_len {
-            let flags = get_inp::<1>(&mut inp).map_err(|_| DecompressError::TooShort)?[0];
-            let flags = flags.view_bits::<Msb0>();
-
-            for i in 0..8 {
-                if outp.cur_pos() == wanted_len {
-                    break;
-                }
-
-                if flags[i] == false {
-                    if inp.len() == 0 {
-                        return Err(DecompressError::TooShort);
-                    }
-                    let b = get_inp::<1>(&mut inp).map_err(|_| DecompressError::TooShort)?[0];
-                    outp.add_lit(b);
-                } else {
-                    let matchb = get_inp::<2>(&mut inp).map_err(|_| DecompressError::TooShort)?;
-                    let matchb = matchb.view_bits::<Msb0>();
-                    let disp = matchb[4..].load_be::<usize>();
-                    let len = matchb[..4].load_be::<usize>();
-
-                    let len = core::cmp::min(len + 3, wanted_len - outp.cur_pos());
-
-                    outp.add_match(disp + 1, len)
-                        .map_err(|_| DecompressError::BadLookback {
-                            disp: disp as u16,
-                            avail: outp.cur_pos() as u16,
-                        })?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn decompress_into(&self, inp: &[u8], outp: &mut [u8]) -> Result<(), DecompressError> {
-        self.decompress(inp, &mut FixedBuf::from(outp))
-    }
-
-    #[cfg(feature = "alloc")]
-    pub fn decompress_new(&self, inp: &[u8]) -> Result<Vec<u8>, DecompressError> {
-        if inp.len() < 4 {
-            return Err(DecompressError::TooShort);
-        }
-        let encoded_len = (inp[1] as usize) | ((inp[2] as usize) << 8) | ((inp[3] as usize) << 16);
-        let mut buf = VecBuf::new(encoded_len, encoded_len);
-        self.decompress(inp, &mut buf)?;
-        Ok(buf.into())
-    }
-}
 
 pub struct Compress {
     engine:
@@ -477,190 +224,182 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nin_wip_new_decomp() {
+    fn nin_all_lits() {
         let mut outvec = Vec::new();
         {
-            let outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x));
-            decompress_make!(decomp, crate);
+            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x));
+            decompress_make!(dec, &mut outp, crate);
 
-            let ret = decomp.add_inp(&[0x10]);
-            assert_eq!(ret, Ok(3));
+            let ret = dec.add_inp(&[0x10]);
+            assert!(ret.is_ok() && ret.unwrap() != 0);
 
-            let ret = decomp.add_inp(&[10, 0, 0]);
-            assert_eq!(ret, Ok(1));
+            let ret = dec.add_inp(&[10]);
+            assert!(ret.is_ok() && ret.unwrap() != 0);
+            let ret = dec.add_inp(&[0]);
+            assert!(ret.is_ok() && ret.unwrap() != 0);
+            let ret = dec.add_inp(&[0]);
+            assert!(ret.is_ok() && ret.unwrap() != 0);
 
-            let ret = decomp.add_inp(&[0]);
-            assert_eq!(ret, Ok(1));
+            let ret = dec.add_inp(&[0]);
+            assert!(ret.is_ok() && ret.unwrap() != 0);
 
             for i in 0..8 {
-                let ret = decomp.add_inp(&[i]);
-                assert_eq!(ret, Ok(1));
+                let ret = dec.add_inp(&[i]);
+                assert!(ret.is_ok() && ret.unwrap() != 0);
             }
 
-            let ret = decomp.add_inp(&[0]);
-            assert_eq!(ret, Ok(1));
-            let ret = decomp.add_inp(&[8]);
-            assert_eq!(ret, Ok(1));
-            let ret = decomp.add_inp(&[9]);
-            assert_eq!(ret, Ok(0));
+            let ret = dec.add_inp(&[0]);
+            assert!(ret.is_ok() && ret.unwrap() != 0);
+            let ret = dec.add_inp(&[8]);
+            assert!(ret.is_ok() && ret.unwrap() != 0);
+            let ret = dec.add_inp(&[9]);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
         }
 
         assert_eq!(outvec, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     #[test]
-    fn nin_all_lits() {
-        let mut outp = Vec::new();
-        let mut dec = DecompressStreaming::new_boxed();
-
-        let ret = dec.decompress(&[0x10], |x| outp.push(x));
-        assert_eq!(ret, Ok(false));
-        assert_eq!(dec.state, DecompressState::HdrLen0);
-
-        let ret = dec.decompress(&[10], |x| outp.push(x));
-        assert_eq!(ret, Ok(false));
-        let ret = dec.decompress(&[0], |x| outp.push(x));
-        assert_eq!(ret, Ok(false));
-        let ret = dec.decompress(&[0], |x| outp.push(x));
-        assert_eq!(ret, Ok(false));
-        assert_eq!(dec.state, DecompressState::BlockFlags);
-        assert_eq!(dec.remaining_bytes, 10);
-
-        let ret = dec.decompress(&[0], |x| outp.push(x));
-        assert_eq!(ret, Ok(false));
-        assert_eq!(dec.state, DecompressState::BlockData0);
-
-        for i in 0..8 {
-            let ret = dec.decompress(&[i], |x| outp.push(x));
-            assert_eq!(ret, Ok(false));
-        }
-        assert_eq!(dec.state, DecompressState::BlockFlags);
-
-        let ret = dec.decompress(&[0], |x| outp.push(x));
-        assert_eq!(ret, Ok(false));
-        let ret = dec.decompress(&[8], |x| outp.push(x));
-        assert_eq!(ret, Ok(false));
-        let ret = dec.decompress(&[9], |x| outp.push(x));
-        assert_eq!(ret, Ok(true));
-
-        assert_eq!(outp, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
-    }
-
-    #[test]
     fn nin_disp_repeating() {
-        let mut outp = Vec::new();
-        let mut dec = DecompressStreaming::new_boxed();
+        let mut outvec = Vec::new();
+        {
+            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x));
+            decompress_make!(dec, &mut outp, crate);
 
-        let ret = dec.decompress(
-            &[0x10, 11, 0, 0, 0b00100000, 0xaa, 0xbb, 0b0110_0000, 1],
-            |x| outp.push(x),
-        );
-        assert_eq!(ret, Ok(true));
+            let ret = dec.add_inp(&[0x10, 11, 0, 0, 0b00100000, 0xaa, 0xbb, 0b0110_0000, 1]);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
         assert_eq!(
-            outp,
+            outvec,
             &[0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa]
         );
     }
 
     #[test]
     fn nin_disp_repeating_overlong() {
-        let mut outp = Vec::new();
-        let mut dec = DecompressStreaming::new_boxed();
+        let mut outvec = Vec::new();
+        {
+            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x));
+            decompress_make!(dec, &mut outp, crate);
 
-        let ret = dec.decompress(
-            &[0x10, 11, 0, 0, 0b00100000, 0xaa, 0xbb, 0b1111_0000, 1],
-            |x| outp.push(x),
-        );
-        assert_eq!(ret, Ok(true));
+            let ret = dec.add_inp(&[0x10, 11, 0, 0, 0b00100000, 0xaa, 0xbb, 0b1111_0000, 1]);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
         assert_eq!(
-            outp,
+            outvec,
             &[0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa]
         );
     }
 
     #[test]
     fn nin_disp_non_repeating() {
-        let mut outp = Vec::new();
-        let mut dec = DecompressStreaming::new_boxed();
+        let mut outvec = Vec::new();
+        {
+            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x));
+            decompress_make!(dec, &mut outp, crate);
 
-        let ret = dec.decompress(
-            &[0x10, 9, 0, 0, 0b00001000, 1, 2, 3, 4, 0b0000_0000, 2, 5, 6],
-            |x| outp.push(x),
-        );
-        assert_eq!(ret, Ok(true));
-        assert_eq!(outp, &[1, 2, 3, 4, 2, 3, 4, 5, 6]);
+            let ret = dec.add_inp(&[0x10, 9, 0, 0, 0b00001000, 1, 2, 3, 4, 0b0000_0000, 2, 5, 6]);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        assert_eq!(outvec, &[1, 2, 3, 4, 2, 3, 4, 5, 6]);
     }
 
     #[test]
     fn nin_disp_invalid() {
-        let mut outp = Vec::new();
-        let mut dec = DecompressStreaming::new_boxed();
+        let mut outvec = Vec::new();
+        {
+            let mut outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x));
+            decompress_make!(dec, &mut outp, crate);
 
-        let ret = dec.decompress(
-            &[0x10, 9, 0, 0, 0b00001000, 1, 2, 3, 4, 0b0000_0000, 4, 5, 6],
-            |x| outp.push(x),
-        );
-        assert_eq!(ret, Err(DecompressError::BadLookback { disp: 4, avail: 4 }));
+            let ret = dec.add_inp(&[0x10, 9, 0, 0, 0b00001000, 1, 2, 3, 4, 0b0000_0000, 4, 5, 6]);
+            assert_eq!(ret, Err(DecompressError::BadLookback { disp: 4, avail: 4 }));
+        }
+        assert_eq!(outvec, &[1, 2, 3, 4]);
     }
 
     #[test]
     fn nin_buffered_short() {
-        let dec = DecompressBuffered::new();
+        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        decompress_make!(dec, &mut outp, crate);
 
-        let ret = dec.decompress_new(&[0x10, 10]);
-        assert_eq!(ret, Err(DecompressError::TooShort));
+        let ret = dec.add_inp(&[0x10, 10]);
+        assert!(ret.is_ok() && ret.unwrap() != 0);
 
-        let ret = dec.decompress_new(&[0x10, 10, 0, 0]);
-        assert_eq!(ret, Err(DecompressError::TooShort));
+        let ret = dec.add_inp(&[0x10, 10, 0, 0]);
+        assert!(ret.is_ok() && ret.unwrap() != 0);
 
-        let ret = dec.decompress_new(&[0x10, 10, 0, 0, 0]);
-        assert_eq!(ret, Err(DecompressError::TooShort));
+        let ret = dec.add_inp(&[0x10, 10, 0, 0, 0]);
+        assert!(ret.is_ok() && ret.unwrap() != 0);
     }
 
     #[test]
     fn nin_buffered_lits() {
-        let dec = DecompressBuffered::new();
+        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        {
+            decompress_make!(dec, &mut outp, crate);
 
-        let ret = dec.decompress_new(&[0x10, 10, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 9, 10, 11]);
-        assert_eq!(ret, Ok(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]));
+            let ret = dec.add_inp(&[0x10, 10, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 9, 10, 11]);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let outvec: Vec<_> = outp.into();
+        assert_eq!(outvec, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
 
     #[test]
     fn nin_buffered_disp_repeating() {
-        let dec = DecompressBuffered::new();
+        {
+            let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+            {
+                decompress_make!(dec, &mut outp, crate);
 
-        let ret = dec.decompress_new(&[0x10, 11, 0, 0, 0b00100000, 0xaa, 0xbb, 0b0110_0000, 1]);
-        assert_eq!(
-            ret,
-            Ok(vec![
-                0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa
-            ])
-        );
+                let ret = dec.add_inp(&[0x10, 11, 0, 0, 0b00100000, 0xaa, 0xbb, 0b0110_0000, 1]);
+                assert!(ret.is_ok() && ret.unwrap() == 0);
+            }
+            let outvec: Vec<_> = outp.into();
+            assert_eq!(
+                outvec,
+                vec![0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa]
+            );
+        }
 
-        let ret = dec.decompress_new(&[0x10, 11, 0, 0, 0b00100000, 0xaa, 0xbb, 0b1111_0000, 1]);
-        assert_eq!(
-            ret,
-            Ok(vec![
-                0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa
-            ])
-        );
+        {
+            let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+            {
+                decompress_make!(dec, &mut outp, crate);
+
+                let ret = dec.add_inp(&[0x10, 11, 0, 0, 0b00100000, 0xaa, 0xbb, 0b1111_0000, 1]);
+                assert!(ret.is_ok() && ret.unwrap() == 0);
+            }
+            let outvec: Vec<_> = outp.into();
+            assert_eq!(
+                outvec,
+                vec![0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa]
+            );
+        }
     }
 
     #[test]
     fn nin_buffered_disp_invalid() {
-        let dec = DecompressBuffered::new();
+        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        {
+            decompress_make!(dec, &mut outp, crate);
 
-        let ret =
-            dec.decompress_new(&[0x10, 9, 0, 0, 0b00001000, 1, 2, 3, 4, 0b0000_0000, 4, 5, 6]);
-        assert_eq!(ret, Err(DecompressError::BadLookback { disp: 4, avail: 4 }));
+            let ret = dec.add_inp(&[0x10, 9, 0, 0, 0b00001000, 1, 2, 3, 4, 0b0000_0000, 4, 5, 6]);
+            assert_eq!(ret, Err(DecompressError::BadLookback { disp: 4, avail: 4 }));
+        }
+        let outvec: Vec<_> = outp.into();
+        assert_eq!(outvec, vec![1, 2, 3, 4]);
     }
 
     #[test]
     fn nin_buffered_disp_truncated() {
-        let dec = DecompressBuffered::new();
+        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        {
+            decompress_make!(dec, &mut outp, crate);
 
-        let ret = dec.decompress_new(&[0x10, 9, 0, 0, 0b00001000, 1, 2, 3, 4, 0b0000_0000]);
-        assert_eq!(ret, Err(DecompressError::TooShort));
+            let ret = dec.add_inp(&[0x10, 9, 0, 0, 0b00001000, 1, 2, 3, 4, 0b0000_0000]);
+            assert!(ret.is_ok() && ret.unwrap() != 0);
+        }
     }
 
     #[test]
@@ -694,8 +433,13 @@ mod tests {
         let mut outp_f = BufWriter::new(File::create(outp_fn).unwrap());
         outp_f.write(&compressed_out).unwrap();
 
-        let dec = DecompressBuffered::new();
-        let decompress = dec.decompress_new(&compressed_out).unwrap();
+        let mut decompress = crate::decompress::VecBuf::new(0, usize::MAX);
+        {
+            decompress_make!(dec, &mut decompress, crate);
+            let ret = dec.add_inp(&compressed_out);
+            assert!(ret.is_ok() && ret.unwrap() == 0);
+        }
+        let decompress: Vec<_> = decompress.into();
 
         assert_eq!(inp, decompress);
     }

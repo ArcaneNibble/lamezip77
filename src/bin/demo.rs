@@ -10,6 +10,8 @@ use lamezip77::{deflate, fastlz, lz4, nintendo_lz};
 
 #[cfg(feature = "std")]
 fn main() -> Result<(), Box<dyn Error>> {
+    use lamezip77::VecBuf;
+
     let args: Vec<OsString> = env::args_os().collect();
 
     if args.len() < 5 {
@@ -82,8 +84,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
         Some("d") => match format.to_str() {
             Some("nintendo") => {
-                let dec = nintendo_lz::DecompressBuffered::new();
-                outp = dec.decompress_new(&inp)?;
+                let mut outvec = VecBuf::new(0, usize::MAX);
+                {
+                    lamezip77::nintendo_lz::decompress_make!(dec, &mut outvec);
+                    let ret = dec.add_inp(&inp)?;
+                    assert_eq!(ret, 0);
+                }
+                outp = outvec.into();
             }
             Some("fastlz") => {
                 let dec = fastlz::DecompressBuffered::new();

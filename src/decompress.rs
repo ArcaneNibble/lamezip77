@@ -200,16 +200,13 @@ impl<'a> LZOutputBuf for PreallocatedBuf<'a> {
     }
 
     fn add_match(&mut self, disp: usize, len: usize) -> Result<(), ()> {
-        if disp < 1 {
-            return Err(());
-        }
-        if disp > self.cur_pos {
+        if disp + 1 > self.cur_pos {
             return Err(());
         }
 
         let len = core::cmp::min(len, self.buf.len() - self.cur_pos);
         for j in 0..len {
-            self.buf[self.cur_pos + j] = self.buf[self.cur_pos - disp + j];
+            self.buf[self.cur_pos + j] = self.buf[self.cur_pos - disp - 1 + j];
         }
         self.cur_pos += len;
 
@@ -259,16 +256,13 @@ impl LZOutputBuf for VecBuf {
     }
 
     fn add_match(&mut self, disp: usize, len: usize) -> Result<(), ()> {
-        if disp < 1 {
-            return Err(());
-        }
-        if disp > self.cur_pos() {
+        if disp + 1 > self.cur_pos() {
             return Err(());
         }
 
         let len = core::cmp::min(len, self.limit - self.cur_pos());
         for _ in 0..len {
-            self.buf.push(self.buf[self.cur_pos() - disp]);
+            self.buf.push(self.buf[self.cur_pos() - disp - 1]);
         }
 
         Ok(())
@@ -350,7 +344,7 @@ where
     }
 
     fn add_match(&mut self, disp: usize, len: usize) -> Result<(), ()> {
-        if disp as usize > self.cur_pos {
+        if disp + 1 > self.cur_pos {
             return Err(());
         }
 
@@ -407,7 +401,7 @@ mod tests {
         buf.add_lits(&[0x11]);
         buf.add_lits(&[0x22]);
         buf.add_lits(&[0x33]);
-        buf.add_match(2, 7).unwrap();
+        buf.add_match(1, 7).unwrap();
 
         assert_eq!(buf_, [0x11, 0x22, 0x33, 0x22, 0x33, 0x22, 0x33, 0x22]);
     }
@@ -439,7 +433,7 @@ mod tests {
         buf.add_lits(&[0x11]);
         buf.add_lits(&[0x22]);
         buf.add_lits(&[0x33]);
-        buf.add_match(2, 7).unwrap();
+        buf.add_match(1, 7).unwrap();
 
         let buf: Vec<_> = buf.into();
         assert_eq!(buf, [0x11, 0x22, 0x33, 0x22, 0x33, 0x22, 0x33, 0x22]);

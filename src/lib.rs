@@ -1,7 +1,7 @@
 #![no_std]
 
 mod decompress;
-pub use decompress::{LZOutputBuf, PreallocatedBuf, VecBuf};
+pub use decompress::{LZOutputBuf, PreallocatedBuf, StreamingDecompressInnerState, VecBuf};
 
 mod sliding_window;
 
