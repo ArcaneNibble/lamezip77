@@ -1,5 +1,7 @@
 #![no_std]
 
+//! Univeral(-ish) LZ77 thing
+
 mod decompress;
 pub use decompress::{
     InputPeeker, LZOutputBuf, PreallocatedBuf, StreamingDecompressInnerState,
