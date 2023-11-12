@@ -852,6 +852,7 @@ impl<const HUFF_BUF_SZ: usize> CompressState<HUFF_BUF_SZ> {
             dist_denom: 0,
         }
     }
+    #[cfg(feature = "alloc")]
     unsafe fn initialize_at(p: *mut Self) {
         assert!(HUFF_BUF_SZ <= u16::MAX as usize);
         let p_huff_buf = core::ptr::addr_of_mut!((*p).huff_buf);

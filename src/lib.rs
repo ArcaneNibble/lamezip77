@@ -3,8 +3,11 @@
 mod decompress;
 pub use decompress::{
     InputPeeker, LZOutputBuf, PreallocatedBuf, StreamingDecompressInnerState,
-    StreamingDecompressState, StreamingOutputBuf, VecBuf,
+    StreamingDecompressState, StreamingOutputBuf,
 };
+
+#[cfg(feature = "alloc")]
+pub use decompress::VecBuf;
 
 mod sliding_window;
 

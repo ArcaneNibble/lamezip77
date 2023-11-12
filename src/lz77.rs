@@ -128,7 +128,7 @@ impl<
             Box::from_raw(p)
         }
     }
-    pub(crate) unsafe fn initialize_at(p: *mut Self) {
+    pub unsafe fn initialize_at(p: *mut Self) {
         assert_eq!(HASH_SZ, 1 << HASH_BITS);
         assert_eq!(DICT_SZ, 1 << DICT_BITS);
         assert!(MIN_MATCH >= 1);
