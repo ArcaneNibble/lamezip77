@@ -105,12 +105,12 @@ impl<'a, 'c, const BUFSZ: usize, const PEEKSZ: usize> Future
     }
 }
 
-pub struct StreamingDecompressExecState<const BUFSZ: usize> {
+pub struct StreamingDecompressInnerState<const BUFSZ: usize> {
     inp: RefCell<InputWithBuf<BUFSZ>>,
     nwaiting: Cell<usize>,
 }
 
-impl<const BUFSZ: usize> StreamingDecompressExecState<BUFSZ> {
+impl<const BUFSZ: usize> StreamingDecompressInnerState<BUFSZ> {
     pub fn new() -> Self {
         Self {
             inp: RefCell::new(InputWithBuf::new()),
@@ -127,7 +127,7 @@ pub struct StreamingDecompressState<'a, F, E, const BUFSZ: usize>
 where
     F: Future<Output = Result<(), E>>,
 {
-    s: &'a StreamingDecompressExecState<BUFSZ>,
+    s: &'a StreamingDecompressInnerState<BUFSZ>,
     f: Pin<&'a mut F>,
 }
 
@@ -135,7 +135,7 @@ impl<'a, F, E, const BUFSZ: usize> StreamingDecompressState<'a, F, E, BUFSZ>
 where
     F: Future<Output = Result<(), E>>,
 {
-    pub fn new(s: &'a StreamingDecompressExecState<BUFSZ>, f: Pin<&'a mut F>) -> Self {
+    pub fn new(s: &'a StreamingDecompressInnerState<BUFSZ>, f: Pin<&'a mut F>) -> Self {
         Self { s, f }
     }
 
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn async_hax_test() {
-        let state = StreamingDecompressExecState::<8>::new();
+        let state = StreamingDecompressInnerState::<8>::new();
         let peek1 = state.get_peeker::<1>();
         let peek2 = state.get_peeker::<2>();
         let x = pin!(testfunc(peek1, peek2));

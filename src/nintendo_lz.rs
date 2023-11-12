@@ -1,7 +1,6 @@
 use bitvec::prelude::*;
 #[cfg(feature = "std")]
 extern crate std;
-use core::future::Future;
 #[cfg(feature = "std")]
 use std::error::Error;
 
@@ -10,6 +9,7 @@ extern crate alloc as alloc_crate;
 #[cfg(feature = "alloc")]
 use alloc_crate::{alloc, boxed::Box, vec::Vec};
 
+use crate::decompress::StreamingOutputBuf;
 use crate::util::*;
 use crate::{
     decompress::{InputPeeker, LZOutputBuf, StreamingDecompressState},
@@ -74,14 +74,7 @@ impl Error for DecompressError {}
 
 const LOOKBACK_SZ: usize = 0x1000;
 
-pub struct Decompress<'a, F>
-where
-    F: Future<Output = Result<(), DecompressError>>,
-{
-    pub state: StreamingDecompressState<'a, F, DecompressError, 4>,
-}
-
-pub async fn decompress<O>(
+pub async fn decompress_impl<O>(
     mut outp: O,
     peek1: InputPeeker<'_, '_, 4, 1>,
     peek2: InputPeeker<'_, '_, 4, 2>,
@@ -127,14 +120,8 @@ where
     Ok(())
 }
 
-impl<'a, F> Decompress<'a, F>
-where
-    F: Future<Output = Result<(), DecompressError>>,
-{
-    pub fn add_inp(&mut self, inp: &[u8]) -> Result<usize, DecompressError> {
-        self.state.add_inp(inp)
-    }
-}
+pub type Decompress<'a, F> = StreamingDecompressState<'a, F, DecompressError, 4>;
+pub type DecompressBuffer<O> = StreamingOutputBuf<O, LOOKBACK_SZ>;
 
 // technically copy-able, but don't want to make it easy to accidentally do so
 #[derive(Clone)]
@@ -485,23 +472,22 @@ mod tests {
         vec::Vec,
     };
 
-    use crate::decompress::StreamingOutputBuf;
-
     use super::*;
 
     #[test]
     fn nin_wip_new_decomp() {
         let mut outvec = Vec::new();
         {
-            let outp = StreamingOutputBuf::<_, LOOKBACK_SZ>::new(|x| outvec.extend_from_slice(x));
+            let outp = DecompressBuffer::new(|x| outvec.extend_from_slice(x));
 
-            let innerstate = crate::decompress::StreamingDecompressExecState::<4>::new();
-            let peek1 = innerstate.get_peeker::<1>();
-            let peek2 = innerstate.get_peeker::<2>();
-            let peek4 = innerstate.get_peeker::<4>();
-            let x = core::pin::pin!(decompress(outp, peek1, peek2, peek4));
-            let state = crate::decompress::StreamingDecompressState::new(&innerstate, x);
-            let mut decomp = Decompress { state };
+            let innerstate = crate::decompress::StreamingDecompressInnerState::<4>::new();
+            let x = core::pin::pin!(decompress_impl(
+                outp,
+                innerstate.get_peeker::<1>(),
+                innerstate.get_peeker::<2>(),
+                innerstate.get_peeker::<4>(),
+            ));
+            let mut decomp = Decompress::new(&innerstate, x);
 
             let ret = decomp.add_inp(&[0x10]);
             assert_eq!(ret, Ok(3));
