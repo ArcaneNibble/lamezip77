@@ -322,30 +322,33 @@ where
     O: FnMut(&[u8]),
 {
     fn add_lits(&mut self, lits: &[u8]) {
-        (self.outp)(lits);
+        let len = core::cmp::min(lits.len(), self.limit - self.cur_pos());
 
-        if self.wptr + lits.len() > LOOKBACK_SZ {
+        (self.outp)(&lits[..len]);
+
+        if self.wptr + len > LOOKBACK_SZ {
             // wrapped
-            if lits.len() < LOOKBACK_SZ {
+            if len < LOOKBACK_SZ {
                 let len_until_end = LOOKBACK_SZ - self.wptr;
                 self.buf[self.wptr..].copy_from_slice(&lits[..len_until_end]);
-                self.buf[..(lits.len() - len_until_end)].copy_from_slice(&lits[len_until_end..]);
-                self.wptr = (self.wptr + lits.len()) % LOOKBACK_SZ;
+                self.buf[..(len - len_until_end)].copy_from_slice(&lits[len_until_end..len]);
+                self.wptr = (self.wptr + len) % LOOKBACK_SZ;
             } else {
-                self.buf
-                    .copy_from_slice(&lits[(lits.len() - LOOKBACK_SZ)..]);
+                self.buf.copy_from_slice(&lits[(len - LOOKBACK_SZ)..len]);
                 self.wptr = 0;
             }
         } else {
             // no wrap
-            self.buf[self.wptr..(self.wptr + lits.len())].copy_from_slice(lits);
-            self.wptr = (self.wptr + lits.len()) % LOOKBACK_SZ;
+            self.buf[self.wptr..(self.wptr + len)].copy_from_slice(&lits[..len]);
+            self.wptr = (self.wptr + len) % LOOKBACK_SZ;
         }
 
-        self.cur_pos += lits.len();
+        self.cur_pos += len;
     }
 
     fn add_match(&mut self, disp: usize, len: usize) -> Result<(), ()> {
+        let len = core::cmp::min(len, self.limit - self.cur_pos());
+
         if disp + 1 > self.cur_pos {
             return Err(());
         }
@@ -444,7 +447,7 @@ mod tests {
     #[test]
     fn decompress_stream_buf() {
         let mut xbuf = Vec::new();
-        let mut buf = StreamingOutputBuf::<_, 4>::new(|x| xbuf.extend_from_slice(x), usize::MAX);
+        let mut buf = StreamingOutputBuf::<_, 4>::new(|x| xbuf.extend_from_slice(x), 11);
 
         buf.add_lits(&[0x11]);
         assert_eq!(buf.buf, [0x11, 0, 0, 0]);
@@ -458,7 +461,7 @@ mod tests {
         assert_eq!(buf.buf, [0x55, 0x66, 0x33, 0x44]);
         assert_eq!(buf.wptr, 2);
 
-        buf.add_lits(&[0x77, 0x88, 0x99, 0xaa, 0xbb]);
+        buf.add_lits(&[0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd]);
         assert_eq!(buf.buf, [0x88, 0x99, 0xaa, 0xbb]);
         assert_eq!(buf.wptr, 0);
 
@@ -471,7 +474,7 @@ mod tests {
     #[test]
     fn decompress_stream_buf_match() {
         let mut xbuf = Vec::new();
-        let mut buf = StreamingOutputBuf::<_, 4>::new(|x| xbuf.extend_from_slice(x), usize::MAX);
+        let mut buf = StreamingOutputBuf::<_, 4>::new(|x| xbuf.extend_from_slice(x), 9);
 
         buf.add_lits(&[0x11, 0x22, 0x33]);
 
@@ -479,7 +482,7 @@ mod tests {
         assert_eq!(buf.buf, [0x33, 0x22, 0x33, 0x33]);
         assert_eq!(buf.wptr, 1);
 
-        buf.add_match(3, 4).unwrap();
+        buf.add_match(3, 100).unwrap();
         assert_eq!(buf.buf, [0x33, 0x22, 0x33, 0x33]);
         assert_eq!(buf.wptr, 1);
 

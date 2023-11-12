@@ -429,11 +429,11 @@ mod tests {
         let inp = std::fs::read(inp_fn).unwrap();
         let ref_ = std::fs::read(ref_fn).unwrap();
 
-        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        let mut outp = crate::decompress::VecBuf::new(0, ref_.len());
         {
             decompress_make!(dec, &mut outp, crate);
             let ret = dec.add_inp(&inp);
-            assert!(ret.is_ok());
+            assert!(ret.is_ok() && ret.unwrap() == 0);
         }
         let outvec: Vec<_> = outp.into();
         assert_eq!(outvec, ref_);
@@ -447,11 +447,11 @@ mod tests {
 
         let inp = std::fs::read(inp_fn).unwrap();
 
-        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        let mut outp = crate::decompress::VecBuf::new(0, 256 * 1024);
         {
             decompress_make!(dec, &mut outp, crate);
             let ret = dec.add_inp(&inp);
-            assert!(ret.is_ok());
+            assert!(ret.is_ok() && ret.unwrap() == 0);
         }
         let outvec: Vec<_> = outp.into();
         assert_eq!(outvec, vec![0; 256 * 1024]);
@@ -467,11 +467,11 @@ mod tests {
         let inp = std::fs::read(inp_fn).unwrap();
         let ref_ = std::fs::read(ref_fn).unwrap();
 
-        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        let mut outp = crate::decompress::VecBuf::new(0, ref_.len());
         {
             decompress_make!(dec, &mut outp, crate);
             let ret = dec.add_inp(&inp);
-            assert!(ret.is_ok());
+            assert!(ret.is_ok() && ret.unwrap() == 0);
         }
         let outvec: Vec<_> = outp.into();
         assert_eq!(outvec, ref_);
@@ -485,11 +485,11 @@ mod tests {
 
         let inp = std::fs::read(inp_fn).unwrap();
 
-        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        let mut outp = crate::decompress::VecBuf::new(0, 256 * 1024);
         {
             decompress_make!(dec, &mut outp, crate);
             let ret = dec.add_inp(&inp);
-            assert!(ret.is_ok());
+            assert!(ret.is_ok() && ret.unwrap() == 0);
         }
         let outvec: Vec<_> = outp.into();
         assert_eq!(outvec, vec![0; 256 * 1024]);
@@ -507,13 +507,15 @@ mod tests {
 
         let mut out = Vec::new();
         {
-            let mut outp = DecompressBuffer::new(|x| out.extend_from_slice(x), usize::MAX);
+            let mut outp = DecompressBuffer::new(|x| out.extend_from_slice(x), ref_.len());
             decompress_make!(dec, &mut outp, crate);
 
+            let mut ret = Ok(usize::MAX);
             for b in inp {
-                let ret = dec.add_inp(&[b]);
+                ret = dec.add_inp(&[b]);
                 assert!(ret.is_ok());
             }
+            assert!(ret.unwrap() == 0);
         }
 
         let mut outp_f = BufWriter::new(File::create(d.join("dump.bin")).unwrap());
@@ -532,13 +534,15 @@ mod tests {
 
         let mut out = Vec::new();
         {
-            let mut outp = DecompressBuffer::new(|x| out.extend_from_slice(x), usize::MAX);
+            let mut outp = DecompressBuffer::new(|x| out.extend_from_slice(x), 256 * 1024);
             decompress_make!(dec, &mut outp, crate);
 
+            let mut ret = Ok(usize::MAX);
             for b in inp {
-                let ret = dec.add_inp(&[b]);
+                ret = dec.add_inp(&[b]);
                 assert!(ret.is_ok());
             }
+            assert!(ret.unwrap() == 0);
         }
 
         assert_eq!(out, vec![0; 256 * 1024]);
@@ -556,13 +560,15 @@ mod tests {
 
         let mut out = Vec::new();
         {
-            let mut outp = DecompressBuffer::new(|x| out.extend_from_slice(x), usize::MAX);
+            let mut outp = DecompressBuffer::new(|x| out.extend_from_slice(x), ref_.len());
             decompress_make!(dec, &mut outp, crate);
 
+            let mut ret = Ok(usize::MAX);
             for b in inp {
-                let ret = dec.add_inp(&[b]);
+                ret = dec.add_inp(&[b]);
                 assert!(ret.is_ok());
             }
+            assert!(ret.unwrap() == 0);
         }
 
         let mut outp_f = BufWriter::new(File::create(d.join("dump.bin")).unwrap());
@@ -581,13 +587,15 @@ mod tests {
 
         let mut out = Vec::new();
         {
-            let mut outp = DecompressBuffer::new(|x| out.extend_from_slice(x), usize::MAX);
+            let mut outp = DecompressBuffer::new(|x| out.extend_from_slice(x), 256 * 1024);
             decompress_make!(dec, &mut outp, crate);
 
+            let mut ret = Ok(usize::MAX);
             for b in inp {
-                let ret = dec.add_inp(&[b]);
+                ret = dec.add_inp(&[b]);
                 assert!(ret.is_ok());
             }
+            assert!(ret.unwrap() == 0);
         }
 
         assert_eq!(out, vec![0; 256 * 1024]);
@@ -619,13 +627,15 @@ mod tests {
 
         let mut out = Vec::new();
         {
-            let mut outp = DecompressBuffer::new(|x| out.extend_from_slice(x), usize::MAX);
+            let mut outp = DecompressBuffer::new(|x| out.extend_from_slice(x), ref_.len());
             decompress_make!(dec, &mut outp, crate);
 
+            let mut ret = Ok(usize::MAX);
             for b in inp {
-                let ret = dec.add_inp(&[b]);
+                ret = dec.add_inp(&[b]);
                 assert!(ret.is_ok());
             }
+            assert!(ret.unwrap() == 0);
         }
 
         assert_eq!(out, ref_);
@@ -651,11 +661,11 @@ mod tests {
         outp_f.write(&compressed_out).unwrap();
         drop(outp_f);
 
-        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
         {
             decompress_make!(dec, &mut outp, crate);
             let ret = dec.add_inp(&compressed_out);
-            assert!(ret.is_ok());
+            assert!(ret.is_ok() && ret.unwrap() == 0);
         }
         let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(inp, decompress_ourselves);
@@ -688,11 +698,11 @@ mod tests {
         outp_f.write(&compressed_out).unwrap();
         drop(outp_f);
 
-        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
         {
             decompress_make!(dec, &mut outp, crate);
             let ret = dec.add_inp(&compressed_out);
-            assert!(ret.is_ok());
+            assert!(ret.is_ok() && ret.unwrap() == 0);
         }
         let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(inp, decompress_ourselves);
@@ -728,11 +738,11 @@ mod tests {
         outp_f.write(&compressed_out).unwrap();
         drop(outp_f);
 
-        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
         {
             decompress_make!(dec, &mut outp, crate);
             let ret = dec.add_inp(&compressed_out);
-            assert!(ret.is_ok());
+            assert!(ret.is_ok() && ret.unwrap() == 0);
         }
         let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(inp, decompress_ourselves);
@@ -765,11 +775,11 @@ mod tests {
         outp_f.write(&compressed_out).unwrap();
         drop(outp_f);
 
-        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
         {
             decompress_make!(dec, &mut outp, crate);
             let ret = dec.add_inp(&compressed_out);
-            assert!(ret.is_ok());
+            assert!(ret.is_ok() && ret.unwrap() == 0);
         }
         let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(inp, decompress_ourselves);
@@ -804,11 +814,11 @@ mod tests {
         outp_f.write(&compressed_out).unwrap();
         drop(outp_f);
 
-        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
         {
             decompress_make!(dec, &mut outp, crate);
             let ret = dec.add_inp(&compressed_out);
-            assert!(ret.is_ok());
+            assert!(ret.is_ok() && ret.unwrap() == 0);
         }
         let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(inp, decompress_ourselves);
@@ -840,11 +850,11 @@ mod tests {
         outp_f.write(&compressed_out).unwrap();
         drop(outp_f);
 
-        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
         {
             decompress_make!(dec, &mut outp, crate);
             let ret = dec.add_inp(&compressed_out);
-            assert!(ret.is_ok());
+            assert!(ret.is_ok() && ret.unwrap() == 0);
         }
         let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(inp, decompress_ourselves);
@@ -892,11 +902,11 @@ mod tests {
         outp_f.write(&compressed_out).unwrap();
         drop(outp_f);
 
-        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
         {
             decompress_make!(dec, &mut outp, crate);
             let ret = dec.add_inp(&compressed_out);
-            assert!(ret.is_ok());
+            assert!(ret.is_ok() && ret.unwrap() == 0);
         }
         let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(inp, decompress_ourselves);
@@ -941,11 +951,11 @@ mod tests {
         outp_f.write(&compressed_out).unwrap();
         drop(outp_f);
 
-        let mut outp = crate::decompress::VecBuf::new(0, usize::MAX);
+        let mut outp = crate::decompress::VecBuf::new(0, inp.len());
         {
             decompress_make!(dec, &mut outp, crate);
             let ret = dec.add_inp(&compressed_out);
-            assert!(ret.is_ok());
+            assert!(ret.is_ok() && ret.unwrap() == 0);
         }
         let decompress_ourselves: Vec<_> = outp.into();
         assert_eq!(inp, decompress_ourselves);
